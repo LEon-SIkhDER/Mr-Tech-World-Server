@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const { MongoClient, ObjectId } = require('mongodb');
 const cors = require('cors');
 const app = express();
@@ -72,24 +72,162 @@ async function connectToMongoDB() {
         // * ------------------------------------ PRODUCT APIs (products) ---------------------------------------
         // ====================================================================================================
 
-        app.get("/product/variants/:id", async (req, res) => {
-            const { id } = req.params
-            const query = { _id: new ObjectId(id) }
-            const projection = {
-                projection: {
-                    _id: 0,
-                    variantAttributes: 1
-                }
-            }
-            const result = await productCollection.findOne(query, projection)
-            res.send(result)
+        // GET /products -> List of products with live variant stock, price ranges, and category name
+        app.get("/products", async (req, res) => {
+            try {
+                const pipeline = [
+                    {
+                        $lookup: {
+                            from: "categories",
+                            let: { catId: "$category" },
+                            pipeline: [
+                                {
+                                    $match: {
+                                        $expr: {
+                                            $or: [
+                                                { $eq: ["$_id", "$$catId"] },
+                                                { $eq: [{ $toString: "$_id" }, { $toString: "$$catId" }] },
+                                                { $eq: ["$name", "$$catId"] }
+                                            ]
+                                        }
+                                    }
+                                }
+                            ],
+                            as: "categoryDoc"
+                        }
+                    },
+                    {
+                        $addFields: {
+                            categoryName: {
+                                $ifNull: [{ $arrayElemAt: ["$categoryDoc.name", 0] }, "Uncategorized"]
+                            },
+                            variants: { $ifNull: ["$variants", []] },
+                            totalStock: {
+                                $reduce: {
+                                    input: { $ifNull: ["$variants", []] },
+                                    initialValue: 0,
+                                    in: { $add: ["$$value", { $toDouble: { $ifNull: ["$$this.quantity", 0] } }] }
+                                }
+                            },
+                            variantsCount: { $size: { $ifNull: ["$variants", []] } },
+                            minRetailPrice: { $min: "$variants.retailPrice" },
+                            maxRetailPrice: { $max: "$variants.retailPrice" },
+                            minMrp: { $min: "$variants.mrp" },
+                            maxMrp: { $max: "$variants.mrp" },
+                            image: {
+                                $let: {
+                                    vars: {
+                                        firstItem: {
+                                            $cond: [
+                                                { $isArray: "$images" },
+                                                { $arrayElemAt: ["$images", 0] },
+                                                { $ifNull: ["$images", "$image"] }
+                                            ]
+                                        }
+                                    },
+                                    in: {
+                                        $cond: [
+                                            { $eq: [{ $type: "$$firstItem" }, "object"] },
+                                            { $ifNull: ["$$firstItem.url", ""] },
+                                            {
+                                                $cond: [
+                                                    { $eq: [{ $type: "$$firstItem" }, "string"] },
+                                                    "$$firstItem",
+                                                    ""
+                                                ]
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    {
+                        $addFields: {
+                            retailPriceRange: {
+                                min: { $ifNull: ["$minRetailPrice", 0] },
+                                max: { $ifNull: ["$maxRetailPrice", 0] },
+                                formatted: {
+                                    $cond: [
+                                        { $gt: [{ $ifNull: ["$maxRetailPrice", 0] }, 0] },
+                                        {
+                                            $cond: [
+                                                { $eq: ["$minRetailPrice", "$maxRetailPrice"] },
+                                                { $concat: ["৳", { $toString: "$minRetailPrice" }] },
+                                                { $concat: ["৳", { $toString: "$minRetailPrice" }, " - ৳", { $toString: "$maxRetailPrice" }] }
+                                            ]
+                                        },
+                                        "N/A"
+                                    ]
+                                }
+                            },
+                            mrpRange: {
+                                min: { $ifNull: ["$minMrp", 0] },
+                                max: { $ifNull: ["$maxMrp", 0] },
+                                formatted: {
+                                    $cond: [
+                                        { $gt: [{ $ifNull: ["$maxMrp", 0] }, 0] },
+                                        {
+                                            $cond: [
+                                                { $eq: ["$minMrp", "$maxMrp"] },
+                                                { $concat: ["৳", { $toString: "$minMrp" }] },
+                                                { $concat: ["৳", { $toString: "$minMrp" }, " - ৳", { $toString: "$maxMrp" }] }
+                                            ]
+                                        },
+                                        "N/A"
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                    {
+                        $project: {
+                            categoryDoc: 0
+                        }
+                    }
+                ];
 
-        })
+                const result = await productCollection.aggregate(pipeline).toArray();
+                res.send(result);
+            } catch (err) {
+                console.error("Error fetching products:", err);
+                res.status(500).send({ message: "Failed to fetch products" });
+            }
+        });
+
+        // GET /product/variants/:id -> Retrieve variant attributes, product type, and existing variants
+        app.get("/product/variants/:id", async (req, res) => {
+            try {
+                const { id } = req.params;
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).send({ message: "Invalid product ID format" });
+                }
+                const query = { _id: new ObjectId(id) };
+                const projection = {
+                    projection: {
+                        name: 1,
+                        productType: 1,
+                        hasImei: 1,
+                        variantAttributes: 1,
+                        variantTypes: 1,
+                        variants: 1
+                    }
+                };
+                const result = await productCollection.findOne(query, projection);
+                if (!result) {
+                    return res.status(404).send({ message: "Product not found" });
+                }
+                res.send(result);
+            } catch (err) {
+                console.error("Error fetching product variants:", err);
+                res.status(500).send({ message: "Failed to fetch variants" });
+            }
+        });
 
         // GET /products-name-id -> Retrieve product names and IDs only for search comboboxes and selection inputs
         app.get("/products-name-id", async (req, res) => {
             try {
-                const projection = { projection: { name: 1 } };
+                const projection = { projection: { name: 1, productType: 1 } };
                 const result = await productCollection.find({}, projection).toArray();
                 res.send(result);
             } catch (err) {
@@ -209,45 +347,90 @@ async function connectToMongoDB() {
                         const existingVariants = Array.isArray(product.variants) ? product.variants : [];
                         const updatedVariants = [...existingVariants];
 
+                        const isSimple = product.productType === "simple" || data.productType === "simple";
+
                         for (const incoming of purchasedVariants) {
                             const incomingTitle = (incoming.title || "").trim().toLowerCase();
                             const incomingBarcode = (incoming.barcode || "").trim().toLowerCase();
+                            const incomingQty = Number(incoming.quantity) || 0;
+                            const incomingPrice = Number(incoming.purchasePrice) || 0;
 
-                            // Match existing variant by title or barcode
+                            // Create new batch record for this purchase
+                            const newBatch = {
+                                batchId: new ObjectId().toString(),
+                                invoiceNo: data.invoiceNo || "",
+                                supplierId: data.supplierId || null,
+                                purchasePrice: incomingPrice,
+                                receivedQuantity: incomingQty,
+                                remainingQuantity: incomingQty,
+                                purchaseDate: data.purchaseDate ? new Date(data.purchaseDate) : new Date(),
+                                createdAt: new Date()
+                            };
+
+                            // Match existing variant by title or barcode (or single standard variant if simple product)
                             const matchIndex = updatedVariants.findIndex((v) => {
-                                const titleMatch = incomingTitle && (v.title || "").trim().toLowerCase() === incomingTitle;
-                                const barcodeMatch = incomingBarcode && (v.barcode || "").trim().toLowerCase() === incomingBarcode;
+                                if (isSimple && updatedVariants.length === 1) {
+                                    return true;
+                                }
+                                const vTitle = (v.title || "").trim().toLowerCase();
+                                const vBarcode = (v.barcode || "").trim().toLowerCase();
+                                const titleMatch = incomingTitle && vTitle && vTitle === incomingTitle;
+                                const barcodeMatch = incomingBarcode && vBarcode && vBarcode === incomingBarcode;
                                 return titleMatch || barcodeMatch;
                             });
 
                             if (matchIndex !== -1) {
-                                // Variant already exists -> add qty and merge new IMEIs
+                                // Variant already exists -> add qty, append batch, and merge new IMEIs
                                 const existing = updatedVariants[matchIndex];
                                 const mergedImeis = Array.from(new Set([
                                     ...(Array.isArray(existing.imeis) ? existing.imeis : []),
                                     ...(Array.isArray(incoming.imeis) ? incoming.imeis : [])
                                 ]));
+
+                                const existingBatches = Array.isArray(existing.batches) ? [...existing.batches] : [];
+                                // Backfill legacy stock if variant had existing quantity but no batches
+                                if (existingBatches.length === 0 && (Number(existing.quantity) || 0) > 0) {
+                                    existingBatches.push({
+                                        batchId: new ObjectId().toString(),
+                                        invoiceNo: "INITIAL-STOCK",
+                                        supplierId: null,
+                                        purchasePrice: Number(existing.purchasePrice) || 0,
+                                        receivedQuantity: Number(existing.quantity) || 0,
+                                        remainingQuantity: Number(existing.quantity) || 0,
+                                        purchaseDate: existing.createdAt ? new Date(existing.createdAt) : new Date(),
+                                        createdAt: new Date()
+                                    });
+                                }
+                                if (incomingQty > 0) {
+                                    existingBatches.push(newBatch);
+                                }
+
+                                // Strip any legacy purchasePrice / lastPurchasePrice off the variant root
+                                const { purchasePrice, lastPurchasePrice, ...cleanedExisting } = existing;
+
                                 updatedVariants[matchIndex] = {
-                                    ...existing,
-                                    quantity: (Number(existing.quantity) || 0) + (Number(incoming.quantity) || 0),
-                                    purchasePrice: Number(incoming.purchasePrice) || existing.purchasePrice || 0,
+                                    ...cleanedExisting,
+                                    title: existing.title || incoming.title || (isSimple ? "Standard" : ""),
+                                    combination: existing.combination || incoming.combination || [],
+                                    quantity: (Number(existing.quantity) || 0) + incomingQty,
                                     retailPrice: Number(incoming.retailPrice) || existing.retailPrice || 0,
                                     mrp: Number(incoming.mrp) || existing.mrp || 0,
                                     barcode: incoming.barcode || existing.barcode || "",
+                                    batches: existingBatches,
                                     imeis: mergedImeis,
                                     updatedAt: new Date()
                                 };
                             } else {
                                 // Brand new variant -> push it into the product variants array
                                 updatedVariants.push({
-                                    title: incoming.title || "",
+                                    title: incoming.title || (isSimple ? "Standard" : ""),
                                     combination: Array.isArray(incoming.combination) ? incoming.combination : [],
                                     attributes: Array.isArray(incoming.attributes) ? incoming.attributes : [],
                                     barcode: incoming.barcode || "",
-                                    purchasePrice: Number(incoming.purchasePrice) || 0,
                                     retailPrice: Number(incoming.retailPrice) || 0,
                                     mrp: Number(incoming.mrp) || 0,
-                                    quantity: Number(incoming.quantity) || 0,
+                                    quantity: incomingQty,
+                                    batches: incomingQty > 0 ? [newBatch] : [],
                                     imeis: Array.isArray(incoming.imeis) ? incoming.imeis : [],
                                     createdAt: new Date(),
                                     updatedAt: new Date()
