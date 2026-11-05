@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const { MongoClient, ObjectId } = require('mongodb');
 const cors = require('cors');
 const app = express();
@@ -28,7 +28,7 @@ async function connectToMongoDB() {
         const supplierCollection = db.collection("suppliers");
 
         // ====================================================================================================
-        // ------------------------------------ CATEGORY APIs (categories) ------------------------------------
+        // * ------------------------------------ CATEGORY APIs (categories) ------------------------------------
         // ====================================================================================================
 
         // GET /categories -> Retrieve all category documents from the categories collection
@@ -69,406 +69,9 @@ async function connectToMongoDB() {
         });
 
         // ====================================================================================================
-        // ------------------------------------ PRODUCT APIs (products) ---------------------------------------
+        // * ------------------------------------ PRODUCT APIs (products) ---------------------------------------
         // ====================================================================================================
 
-        // GET /products -> Aggregated lightweight product list with variants count, stock, and price ranges
-        app.get("/products", async (req, res) => {
-            try {
-                const pipeline = [
-                    // 1. Lookup purchases from purchaseCollection (matching by ObjectId or String)
-                    {
-                        $lookup: {
-                            from: "purchases",
-                            let: { productIdStr: { $toString: "$_id" }, productIdObj: "$_id" },
-                            pipeline: [
-                                {
-                                    $match: {
-                                        $expr: {
-                                            $or: [
-                                                { $eq: ["$productId", "$$productIdStr"] },
-                                                { $eq: ["$productId", "$$productIdObj"] },
-                                                { $eq: [{ $toString: "$productId" }, "$$productIdStr"] }
-                                            ]
-                                        }
-                                    }
-                                }
-                            ],
-                            as: "purchases"
-                        }
-                    },
-
-                    // 2. Lookup category name from categories collection by category ID
-                    {
-                        $lookup: {
-                            from: "categories",
-                            let: {
-                                catIdStr: { $toString: { $ifNull: ["$category", ""] } },
-                                rawCategory: "$category"
-                            },
-                            pipeline: [
-                                {
-                                    $match: {
-                                        $expr: {
-                                            $or: [
-                                                { $eq: [{ $toString: "$_id" }, "$$catIdStr"] },
-                                                { $eq: ["$_id", "$$rawCategory"] },
-                                                { $eq: ["$name", "$$catIdStr"] }
-                                            ]
-                                        }
-                                    }
-                                }
-                            ],
-                            as: "categoryDoc"
-                        }
-                    },
-
-                    // 3. Resolve category name and category ID fields, and flatten variants from all purchases
-                    {
-                        $addFields: {
-                            category: { $ifNull: ["$category", ""] },
-                            categoryId: { $ifNull: ["$category", ""] },
-                            categoryName: {
-                                $ifNull: [{ $arrayElemAt: ["$categoryDoc.name", 0] }, "Uncategorized"]
-                            },
-                            "category name": {
-                                $ifNull: [{ $arrayElemAt: ["$categoryDoc.name", 0] }, "Uncategorized"]
-                            },
-                            category_name: {
-                                $ifNull: [{ $arrayElemAt: ["$categoryDoc.name", 0] }, "Uncategorized"]
-                            },
-                            allPurchaseVariants: {
-                                $reduce: {
-                                    input: "$purchases.variants",
-                                    initialValue: [],
-                                    in: { $concatArrays: ["$$value", { $ifNull: ["$$this", []] }] }
-                                }
-                            }
-                        }
-                    },
-
-                    // 4. Source of variants: purchase collection if available, fallback to product.variants
-                    {
-                        $addFields: {
-                            activeVariants: {
-                                $cond: [
-                                    { $gt: [{ $size: "$allPurchaseVariants" }, 0] },
-                                    "$allPurchaseVariants",
-                                    { $ifNull: ["$variants", []] }
-                                ]
-                            }
-                        }
-                    },
-
-                    // 5. Unique variant combinations/titles, total stock, and in-stock variants
-                    {
-                        $addFields: {
-                            uniqueVariantTitles: {
-                                $setUnion: [
-                                    {
-                                        $map: {
-                                            input: "$activeVariants",
-                                            as: "v",
-                                            in: {
-                                                $ifNull: [
-                                                    "$$v.title",
-                                                    {
-                                                        $reduce: {
-                                                            input: { $ifNull: ["$$v.combination", []] },
-                                                            initialValue: "",
-                                                            in: {
-                                                                $cond: [
-                                                                    { $eq: ["$$value", ""] },
-                                                                    "$$this",
-                                                                    { $concat: ["$$value", " / ", "$$this"] }
-                                                                ]
-                                                            }
-                                                        }
-                                                    }
-                                                ]
-                                            }
-                                        }
-                                    },
-                                    []
-                                ]
-                            },
-                            totalStock: {
-                                $reduce: {
-                                    input: "$activeVariants",
-                                    initialValue: 0,
-                                    in: {
-                                        $add: [
-                                            "$$value",
-                                            { $toDouble: { $ifNull: ["$$this.quantity", 0] } }
-                                        ]
-                                    }
-                                }
-                            },
-                            inStockVariants: {
-                                $filter: {
-                                    input: "$activeVariants",
-                                    as: "v",
-                                    cond: { $gt: [{ $toDouble: { $ifNull: ["$$v.quantity", 0] } }, 0] }
-                                }
-                            }
-                        }
-                    },
-
-                    // 6. Filter prices for in-stock items (quantity > 0) vs all variants
-                    {
-                        $addFields: {
-                            inStockPurchasePriced: {
-                                $filter: {
-                                    input: "$inStockVariants",
-                                    as: "v",
-                                    cond: { $gt: [{ $toDouble: { $ifNull: ["$$v.purchasePrice", 0] } }, 0] }
-                                }
-                            },
-                            allPurchasePriced: {
-                                $filter: {
-                                    input: "$activeVariants",
-                                    as: "v",
-                                    cond: { $gt: [{ $toDouble: { $ifNull: ["$$v.purchasePrice", 0] } }, 0] }
-                                }
-                            },
-                            inStockRetailPriced: {
-                                $filter: {
-                                    input: "$inStockVariants",
-                                    as: "v",
-                                    cond: { $gt: [{ $toDouble: { $ifNull: ["$$v.retailPrice", 0] } }, 0] }
-                                }
-                            },
-                            allRetailPriced: {
-                                $filter: {
-                                    input: "$activeVariants",
-                                    as: "v",
-                                    cond: { $gt: [{ $toDouble: { $ifNull: ["$$v.retailPrice", 0] } }, 0] }
-                                }
-                            },
-                            inStockMrpPriced: {
-                                $filter: {
-                                    input: "$inStockVariants",
-                                    as: "v",
-                                    cond: { $gt: [{ $toDouble: { $ifNull: ["$$v.mrp", 0] } }, 0] }
-                                }
-                            },
-                            allMrpPriced: {
-                                $filter: {
-                                    input: "$activeVariants",
-                                    as: "v",
-                                    cond: { $gt: [{ $toDouble: { $ifNull: ["$$v.mrp", 0] } }, 0] }
-                                }
-                            }
-                        }
-                    },
-
-                    // 7. Prioritize in-stock price range, fall back to all if out of stock
-                    {
-                        $addFields: {
-                            targetPurchasePriced: {
-                                $cond: [
-                                    { $gt: [{ $size: "$inStockPurchasePriced" }, 0] },
-                                    "$inStockPurchasePriced",
-                                    "$allPurchasePriced"
-                                ]
-                            },
-                            targetRetailPriced: {
-                                $cond: [
-                                    { $gt: [{ $size: "$inStockRetailPriced" }, 0] },
-                                    "$inStockRetailPriced",
-                                    "$allRetailPriced"
-                                ]
-                            },
-                            targetMrpPriced: {
-                                $cond: [
-                                    { $gt: [{ $size: "$inStockMrpPriced" }, 0] },
-                                    "$inStockMrpPriced",
-                                    "$allMrpPriced"
-                                ]
-                            }
-                        }
-                    },
-
-                    // 8. Compute min and max values
-                    {
-                        $addFields: {
-                            minPurchasePrice: {
-                                $cond: [
-                                    { $gt: [{ $size: "$targetPurchasePriced" }, 0] },
-                                    { $min: "$targetPurchasePriced.purchasePrice" },
-                                    0
-                                ]
-                            },
-                            maxPurchasePrice: {
-                                $cond: [
-                                    { $gt: [{ $size: "$targetPurchasePriced" }, 0] },
-                                    { $max: "$targetPurchasePriced.purchasePrice" },
-                                    0
-                                ]
-                            },
-                            minRetailPrice: {
-                                $cond: [
-                                    { $gt: [{ $size: "$targetRetailPriced" }, 0] },
-                                    { $min: "$targetRetailPriced.retailPrice" },
-                                    0
-                                ]
-                            },
-                            maxRetailPrice: {
-                                $cond: [
-                                    { $gt: [{ $size: "$targetRetailPriced" }, 0] },
-                                    { $max: "$targetRetailPriced.retailPrice" },
-                                    0
-                                ]
-                            },
-                            minMrp: {
-                                $cond: [
-                                    { $gt: [{ $size: "$targetMrpPriced" }, 0] },
-                                    { $min: "$targetMrpPriced.mrp" },
-                                    0
-                                ]
-                            },
-                            maxMrp: {
-                                $cond: [
-                                    { $gt: [{ $size: "$targetMrpPriced" }, 0] },
-                                    { $max: "$targetMrpPriced.mrp" },
-                                    0
-                                ]
-                            },
-                            variantsCount: { $size: "$uniqueVariantTitles" }
-                        }
-                    },
-
-                    // 9. Format range objects and extract first image string URL
-                    {
-                        $addFields: {
-                            purchasePriceRange: {
-                                min: "$minPurchasePrice",
-                                max: "$maxPurchasePrice",
-                                formatted: {
-                                    $cond: [
-                                        { $gt: ["$maxPurchasePrice", 0] },
-                                        {
-                                            $cond: [
-                                                { $eq: ["$minPurchasePrice", "$maxPurchasePrice"] },
-                                                { $concat: ["৳", { $toString: "$minPurchasePrice" }] },
-                                                { $concat: ["৳", { $toString: "$minPurchasePrice" }, " - ৳", { $toString: "$maxPurchasePrice" }] }
-                                            ]
-                                        },
-                                        "N/A"
-                                    ]
-                                }
-                            },
-                            retailPriceRange: {
-                                min: "$minRetailPrice",
-                                max: "$maxRetailPrice",
-                                formatted: {
-                                    $cond: [
-                                        { $gt: ["$maxRetailPrice", 0] },
-                                        {
-                                            $cond: [
-                                                { $eq: ["$minRetailPrice", "$maxRetailPrice"] },
-                                                { $concat: ["৳", { $toString: "$minRetailPrice" }] },
-                                                { $concat: ["৳", { $toString: "$minRetailPrice" }, " - ৳", { $toString: "$maxRetailPrice" }] }
-                                            ]
-                                        },
-                                        "N/A"
-                                    ]
-                                }
-                            },
-                            mrpRange: {
-                                min: "$minMrp",
-                                max: "$maxMrp",
-                                formatted: {
-                                    $cond: [
-                                        { $gt: ["$maxMrp", 0] },
-                                        {
-                                            $cond: [
-                                                { $eq: ["$minMrp", "$maxMrp"] },
-                                                { $concat: ["৳", { $toString: "$minMrp" }] },
-                                                { $concat: ["৳", { $toString: "$minMrp" }, " - ৳", { $toString: "$maxMrp" }] }
-                                            ]
-                                        },
-                                        "N/A"
-                                    ]
-                                }
-                            },
-                            image: {
-                                $let: {
-                                    vars: {
-                                        firstItem: {
-                                            $cond: [
-                                                { $isArray: "$images" },
-                                                { $arrayElemAt: ["$images", 0] },
-                                                { $ifNull: ["$images", "$image"] }
-                                            ]
-                                        }
-                                    },
-                                    in: {
-                                        $cond: [
-                                            { $eq: [{ $type: "$$firstItem" }, "object"] },
-                                            { $ifNull: ["$$firstItem.url", ""] },
-                                            {
-                                                $cond: [
-                                                    { $eq: [{ $type: "$$firstItem" }, "string"] },
-                                                    "$$firstItem",
-                                                    ""
-                                                ]
-                                            }
-                                        ]
-                                    }
-                                }
-                            }
-                        }
-                    },
-
-                    // 10. Clean up internal temporary fields and omit requested heavy fields to make API lightweight
-                    {
-                        $project: {
-                            // Internal temporary fields
-                            purchases: 0,
-                            categoryDoc: 0,
-                            allPurchaseVariants: 0,
-                            activeVariants: 0,
-                            uniqueVariantTitles: 0,
-                            inStockVariants: 0,
-                            inStockPurchasePriced: 0,
-                            allPurchasePriced: 0,
-                            inStockRetailPriced: 0,
-                            allRetailPriced: 0,
-                            inStockMrpPriced: 0,
-                            allMrpPriced: 0,
-                            targetPurchasePriced: 0,
-                            targetRetailPriced: 0,
-                            targetMrpPriced: 0,
-
-                            // Fields explicitly excluded to make API lightweight:
-                            description: 0,
-                            createdAt: 0,
-                            updatedAt: 0,
-                            hasImei: 0,
-                            variantTypes: 0,
-                            variants: 0,
-                            minPurchasePrice: 0,
-                            maxPurchasePrice: 0,
-                            minRetailPrice: 0,
-                            maxRetailPrice: 0,
-                            minMrp: 0,
-                            maxMrp: 0,
-                            totalVariants: 0,
-                            images: 0,
-                            "category name": 0,
-                            category_name: 0
-                        }
-                    }
-                ];
-
-                const result = await productCollection.aggregate(pipeline).toArray();
-                res.send(result);
-            } catch (err) {
-                console.error("Error fetching aggregated products:", err);
-                res.status(500).send({ message: "Failed to fetch products" });
-            }
-        });
         app.get("/product/variants/:id", async (req, res) => {
             const { id } = req.params
             const query = { _id: new ObjectId(id) }
@@ -570,7 +173,7 @@ async function connectToMongoDB() {
         });
 
         // ====================================================================================================
-        // ------------------------------------ PURCHASE APIs (purchases) -------------------------------------
+        // * ------------------------------------ PURCHASE APIs (purchases) -------------------------------------
         // ====================================================================================================
 
         // GET /purchases -> Retrieve all purchase inventory transactions and invoice records
@@ -584,13 +187,87 @@ async function connectToMongoDB() {
             }
         });
 
-        // POST /purchase -> Record a new stock purchase transaction with supplier details, invoice, and variants
+        // POST /purchase -> Record a new stock purchase and merge variant stock + IMEIs into the product collection
         app.post("/purchase", async (req, res) => {
             try {
                 const data = req.body;
                 data.createdAt = new Date();
                 data.updatedAt = new Date();
+
+                // 1. Save the purchase record as an audit log
                 const result = await purchaseCollection.insertOne(data);
+
+                // 2. Merge purchased variants into the product collection (live stock source of truth)
+                const productId = data.productId;
+                const purchasedVariants = Array.isArray(data.variants) ? data.variants : [];
+
+                if (productId && ObjectId.isValid(productId) && purchasedVariants.length > 0) {
+                    const productQuery = { _id: new ObjectId(productId) };
+                    const product = await productCollection.findOne(productQuery);
+
+                    if (product) {
+                        const existingVariants = Array.isArray(product.variants) ? product.variants : [];
+                        const updatedVariants = [...existingVariants];
+
+                        for (const incoming of purchasedVariants) {
+                            const incomingTitle = (incoming.title || "").trim().toLowerCase();
+                            const incomingBarcode = (incoming.barcode || "").trim().toLowerCase();
+
+                            // Match existing variant by title or barcode
+                            const matchIndex = updatedVariants.findIndex((v) => {
+                                const titleMatch = incomingTitle && (v.title || "").trim().toLowerCase() === incomingTitle;
+                                const barcodeMatch = incomingBarcode && (v.barcode || "").trim().toLowerCase() === incomingBarcode;
+                                return titleMatch || barcodeMatch;
+                            });
+
+                            if (matchIndex !== -1) {
+                                // Variant already exists -> add qty and merge new IMEIs
+                                const existing = updatedVariants[matchIndex];
+                                const mergedImeis = Array.from(new Set([
+                                    ...(Array.isArray(existing.imeis) ? existing.imeis : []),
+                                    ...(Array.isArray(incoming.imeis) ? incoming.imeis : [])
+                                ]));
+                                updatedVariants[matchIndex] = {
+                                    ...existing,
+                                    quantity: (Number(existing.quantity) || 0) + (Number(incoming.quantity) || 0),
+                                    purchasePrice: Number(incoming.purchasePrice) || existing.purchasePrice || 0,
+                                    retailPrice: Number(incoming.retailPrice) || existing.retailPrice || 0,
+                                    mrp: Number(incoming.mrp) || existing.mrp || 0,
+                                    barcode: incoming.barcode || existing.barcode || "",
+                                    imeis: mergedImeis,
+                                    updatedAt: new Date()
+                                };
+                            } else {
+                                // Brand new variant -> push it into the product variants array
+                                updatedVariants.push({
+                                    title: incoming.title || "",
+                                    combination: Array.isArray(incoming.combination) ? incoming.combination : [],
+                                    attributes: Array.isArray(incoming.attributes) ? incoming.attributes : [],
+                                    barcode: incoming.barcode || "",
+                                    purchasePrice: Number(incoming.purchasePrice) || 0,
+                                    retailPrice: Number(incoming.retailPrice) || 0,
+                                    mrp: Number(incoming.mrp) || 0,
+                                    quantity: Number(incoming.quantity) || 0,
+                                    imeis: Array.isArray(incoming.imeis) ? incoming.imeis : [],
+                                    createdAt: new Date(),
+                                    updatedAt: new Date()
+                                });
+                            }
+                        }
+
+                        // Sync hasImei flag on the product if this purchase tracks IMEIs
+                        const hasImeiUpdate = data.hasImei === true ? { hasImei: true } : {};
+
+                        await productCollection.updateOne(productQuery, {
+                            $set: {
+                                variants: updatedVariants,
+                                ...hasImeiUpdate,
+                                updatedAt: new Date()
+                            }
+                        });
+                    }
+                }
+
                 res.send(result);
             } catch (err) {
                 console.error("Error creating purchase:", err);
@@ -599,7 +276,7 @@ async function connectToMongoDB() {
         });
 
         // ====================================================================================================
-        // ------------------------------------ SUPPLIER APIs (suppliers) -------------------------------------
+        // * ------------------------------------ SUPPLIER APIs (suppliers) -------------------------------------
         // ====================================================================================================
 
         // GET /suppliers -> Retrieve all registered suppliers with complete contact and address details
