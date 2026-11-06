@@ -224,6 +224,54 @@ async function connectToMongoDB() {
             }
         });
 
+        app.get("/products/pos", async (req, res) => {
+            try {
+                const { search, category, limit, skip } = req.query;
+                let query = {};
+                if (search) {
+                    query.name = { $regex: search, $options: 'i' };
+                }
+                if (category) {
+                    query.category = category;
+                }
+
+                const skipNum = Number(skip) || 0;
+                const limitNum = Number(limit) || 12;
+
+                const [totalProductCounts, products] = await Promise.all([
+                    productCollection.countDocuments(query),
+                    productCollection.aggregate([
+                        { $match: query },
+                        { $skip: skipNum },
+                        { $limit: limitNum },
+                        {
+                            $set: {
+                                image: {
+                                    $getField: {
+                                        field: "url",
+                                        input: { $arrayElemAt: ["$images", 0] }
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            $project: {
+                                images: 0
+                            }
+                        }
+                    ]).toArray()
+                ]);
+
+                res.send({
+                    products,
+                    totalProductCounts
+                });
+            } catch (err) {
+                console.error("Error fetching POS products:", err);
+                res.status(500).send({ message: "Failed to fetch products" });
+            }
+        });
+
         // GET /products-name-id -> Retrieve product names and IDs only for search comboboxes and selection inputs
         app.get("/products-name-id", async (req, res) => {
             try {
@@ -332,6 +380,25 @@ async function connectToMongoDB() {
                 data.createdAt = new Date();
                 data.updatedAt = new Date();
 
+                // Normalize IMEIs across purchased variants
+                if (Array.isArray(data.variants)) {
+                    data.variants = data.variants.map(v => ({
+                        ...v,
+                        imeis: (Array.isArray(v.imeis) ? v.imeis : []).map(item => {
+                            if (typeof item === 'string') {
+                                const trimmed = item.trim();
+                                return trimmed ? { imei1: trimmed, imei2: "" } : null;
+                            }
+                            if (item && typeof item === 'object') {
+                                const im1 = (item.imei1 || item.imei || "").trim();
+                                const im2 = (item.imei2 || "").trim();
+                                return im1 ? { imei1: im1, imei2: im2 } : null;
+                            }
+                            return null;
+                        }).filter(Boolean)
+                    }));
+                }
+
                 // 1. Save the purchase record as an audit log
                 const result = await purchaseCollection.insertOne(data);
 
@@ -354,8 +421,9 @@ async function connectToMongoDB() {
                             const incomingBarcode = (incoming.barcode || "").trim().toLowerCase();
                             const incomingQty = Number(incoming.quantity) || 0;
                             const incomingPrice = Number(incoming.purchasePrice) || 0;
+                            const incomingImeis = Array.isArray(incoming.imeis) ? incoming.imeis : [];
 
-                            // Create new batch record for this purchase
+                            // Create new batch record for this purchase with its specific IMEIs
                             const newBatch = {
                                 batchId: new ObjectId().toString(),
                                 invoiceNo: data.invoiceNo || "",
@@ -363,6 +431,7 @@ async function connectToMongoDB() {
                                 purchasePrice: incomingPrice,
                                 receivedQuantity: incomingQty,
                                 remainingQuantity: incomingQty,
+                                imeis: incomingImeis,
                                 purchaseDate: data.purchaseDate ? new Date(data.purchaseDate) : new Date(),
                                 createdAt: new Date()
                             };
@@ -380,16 +449,24 @@ async function connectToMongoDB() {
                             });
 
                             if (matchIndex !== -1) {
-                                // Variant already exists -> add qty, append batch, and merge new IMEIs
                                 const existing = updatedVariants[matchIndex];
-                                const mergedImeis = Array.from(new Set([
-                                    ...(Array.isArray(existing.imeis) ? existing.imeis : []),
-                                    ...(Array.isArray(incoming.imeis) ? incoming.imeis : [])
-                                ]));
-
                                 const existingBatches = Array.isArray(existing.batches) ? [...existing.batches] : [];
+
                                 // Backfill legacy stock if variant had existing quantity but no batches
                                 if (existingBatches.length === 0 && (Number(existing.quantity) || 0) > 0) {
+                                    const legacyImeis = (Array.isArray(existing.imeis) ? existing.imeis : []).map(item => {
+                                        if (typeof item === 'string') {
+                                            const trimmed = item.trim();
+                                            return trimmed ? { imei1: trimmed, imei2: "" } : null;
+                                        }
+                                        if (item && typeof item === 'object') {
+                                            const im1 = (item.imei1 || item.imei || "").trim();
+                                            const im2 = (item.imei2 || "").trim();
+                                            return im1 ? { imei1: im1, imei2: im2 } : null;
+                                        }
+                                        return null;
+                                    }).filter(Boolean);
+
                                     existingBatches.push({
                                         batchId: new ObjectId().toString(),
                                         invoiceNo: "INITIAL-STOCK",
@@ -397,12 +474,35 @@ async function connectToMongoDB() {
                                         purchasePrice: Number(existing.purchasePrice) || 0,
                                         receivedQuantity: Number(existing.quantity) || 0,
                                         remainingQuantity: Number(existing.quantity) || 0,
+                                        imeis: legacyImeis,
                                         purchaseDate: existing.createdAt ? new Date(existing.createdAt) : new Date(),
                                         createdAt: new Date()
                                     });
                                 }
                                 if (incomingQty > 0) {
                                     existingBatches.push(newBatch);
+                                }
+
+                                // Gather all active IMEIs across all batches for fast variant lookup
+                                const seen = new Set();
+                                const allActiveImeis = [];
+                                for (const b of existingBatches) {
+                                    if (Array.isArray(b.imeis)) {
+                                        for (const item of b.imeis) {
+                                            let im1 = "";
+                                            let im2 = "";
+                                            if (typeof item === 'string') {
+                                                im1 = item.trim();
+                                            } else if (item && typeof item === 'object') {
+                                                im1 = (item.imei1 || item.imei || "").trim();
+                                                im2 = (item.imei2 || "").trim();
+                                            }
+                                            if (im1 && !seen.has(im1.toLowerCase())) {
+                                                seen.add(im1.toLowerCase());
+                                                allActiveImeis.push({ imei1: im1, imei2: im2 });
+                                            }
+                                        }
+                                    }
                                 }
 
                                 // Strip any legacy purchasePrice / lastPurchasePrice off the variant root
@@ -417,7 +517,7 @@ async function connectToMongoDB() {
                                     mrp: Number(incoming.mrp) || existing.mrp || 0,
                                     barcode: incoming.barcode || existing.barcode || "",
                                     batches: existingBatches,
-                                    imeis: mergedImeis,
+                                    imeis: allActiveImeis,
                                     updatedAt: new Date()
                                 };
                             } else {
@@ -431,7 +531,7 @@ async function connectToMongoDB() {
                                     mrp: Number(incoming.mrp) || 0,
                                     quantity: incomingQty,
                                     batches: incomingQty > 0 ? [newBatch] : [],
-                                    imeis: Array.isArray(incoming.imeis) ? incoming.imeis : [],
+                                    imeis: incomingImeis,
                                     createdAt: new Date(),
                                     updatedAt: new Date()
                                 });
