@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const { MongoClient, ObjectId } = require('mongodb');
 const cors = require('cors');
 const app = express();
@@ -283,6 +283,138 @@ async function connectToMongoDB() {
                 res.status(500).send({ message: "Failed to fetch products" });
             }
         });
+
+        // GET /product/scan/barcode/:barcode -> Scan barcode (or IMEI) and return projected product data shaped for POS cart
+        app.get("/product/scan/barcode/:barcode", async (req, res) => {
+            try {
+                const { barcode } = req.params;
+                const cleanBarcode = String(barcode || '').trim();
+                const cleanId = cleanBarcode;
+                if (!cleanBarcode) {
+                    return res.status(400).send({ message: "Barcode is required" });
+                }
+
+                const idRegex = new RegExp(`^${cleanId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i');
+
+                const query = {
+                    $or: [
+                        { "variants.barcode": idRegex },
+                        { barcode: idRegex },
+                        { "variants.imeis.imei1": idRegex },
+                        { "variants.imeis.imei2": idRegex },
+                        { "variants.imeis": idRegex }
+                    ]
+                };
+
+                const projection = {
+                    projection: {
+                        name: 1,
+                        brand: 1,
+                        model: 1,
+                        images: 1,
+                        image: 1,
+                        hasImei: 1,
+                        warranty: 1,
+                        productType: 1,
+                        barcode: 1,
+                        retailPrice: 1,
+                        mrp: 1,
+                        quantity: 1,
+                        variants: {
+                            $elemMatch: {
+                                $or: [
+                                    { barcode: idRegex },
+                                    { "imeis.imei1": idRegex },
+                                    { "imeis.imei2": idRegex },
+                                    { imeis: idRegex }
+                                ]
+                            }
+                        }
+                    }
+                };
+
+                const product = await productCollection.findOne(query, projection);
+                if (!product) {
+                    return res.status(404).send({ message: "Product not found" });
+                }
+
+                const variant = Array.isArray(product.variants) && product.variants.length > 0
+                    ? product.variants[0]
+                    : {
+                        title: 'Standard',
+                        barcode: product.barcode || cleanId,
+                        retailPrice: Number(product.retailPrice) || 0,
+                        mrp: Number(product.mrp) || 0,
+                        quantity: Number(product.quantity) || 0,
+                        imeis: Array.isArray(product.imeis) ? product.imeis : []
+                    };
+
+                const currentPriceType = req.query.priceType === 'retailPrice' ? 'retailPrice' : 'mrp';
+                const retailPrice = Number(variant.retailPrice) || Number(product.retailPrice) || 0;
+                const mrp = Number(variant.mrp) || Number(product.mrp) || retailPrice;
+                const unitPrice = currentPriceType === 'retailPrice' ? retailPrice : mrp;
+                const availableStock = Number(variant.quantity) || 0;
+
+                let image = '';
+                if (typeof product.image === 'string' && product.image) {
+                    image = product.image;
+                } else if (Array.isArray(product.images) && product.images.length > 0) {
+                    const firstImg = product.images[0];
+                    image = typeof firstImg === 'object' && firstImg !== null ? (firstImg.url || '') : String(firstImg || '');
+                }
+
+                const itemKey = `${product._id}-${variant.barcode || variant.title || 'default'}`;
+
+                // Check if scanned code matches any IMEI of the variant
+                let selectedImeis = [];
+                const matchedImeiObj = Array.isArray(variant.imeis) && variant.imeis.find(item => {
+                    if (typeof item === 'object' && item !== null) {
+                        return (item.imei1 && item.imei1.toLowerCase() === cleanId.toLowerCase()) ||
+                               (item.imei2 && item.imei2.toLowerCase() === cleanId.toLowerCase());
+                    }
+                    return String(item || '').toLowerCase() === cleanId.toLowerCase();
+                });
+                if (matchedImeiObj) {
+                    const matchedVal = typeof matchedImeiObj === 'object'
+                        ? (matchedImeiObj.imei1?.toLowerCase() === cleanId.toLowerCase() ? matchedImeiObj.imei1 : matchedImeiObj.imei2)
+                        : matchedImeiObj;
+                    selectedImeis = [matchedVal];
+                }
+
+                const cartData = {
+                    itemKey,
+                    productId: product._id,
+                    name: product.name || 'Unnamed Product',
+                    brand: product.brand || '',
+                    model: product.model || '',
+                    image,
+                    variantTitle: variant.title || '',
+                    barcode: variant.barcode || cleanId,
+                    retailPrice,
+                    mrp,
+                    priceType: currentPriceType,
+                    unitPrice,
+                    quantity: 1,
+                    total: unitPrice,
+                    maxStock: availableStock,
+                    hasImei: Boolean(product.hasImei),
+                    availableImeis: Array.isArray(variant.imeis) ? variant.imeis : [],
+                    selectedImeis,
+                    warranty: product.warranty || 0
+                };
+
+                res.send(cartData);
+            } catch (err) {
+                console.error("Error scanning product barcode:", err);
+                res.status(500).send({ message: "Failed to scan product barcode" });
+            }
+        });
+
+        // GET /products/scan/barcode/:barcode -> Route alias for plural URL compatibility
+        // app.get("/products/scan/barcode/:barcode", (req, res) => {
+        //     const queryParams = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
+        //     res.redirect(307, `/product/scan/barcode/${encodeURIComponent(req.params.barcode)}${queryParams}`);
+        // });
 
         // GET /product/:id -> Retrieve complete single product details by product ObjectId
         app.get("/product/:id", async (req, res) => {
