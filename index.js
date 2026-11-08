@@ -32,10 +32,10 @@ async function connectToMongoDB() {
         // Ensure unique index on invoiceNo to guarantee mathematical non-duplication
         salesCollection.createIndex({ invoiceNo: 1 }, { unique: true }).catch(err => console.error("Error creating sales invoice index:", err));
 
-        salesCollection.createIndex({ createdAt: -1 }).catch(() => {});
-        salesCollection.createIndex({ paymentStatus: 1 }).catch(() => {});
-        salesCollection.createIndex({ paymentMethod: 1 }).catch(() => {});
-        salesCollection.createIndex({ totalPayable: 1 }).catch(() => {});
+        salesCollection.createIndex({ createdAt: -1 }).catch(() => { });
+        salesCollection.createIndex({ paymentStatus: 1 }).catch(() => { });
+        salesCollection.createIndex({ paymentMethod: 1 }).catch(() => { });
+        salesCollection.createIndex({ totalPayable: 1 }).catch(() => { });
 
         // GET /sales/report -> High performance aggregation API for sales report, filters, stats, & pagination
         app.get("/sales/report", async (req, res) => {
@@ -357,8 +357,8 @@ async function connectToMongoDB() {
                             const variantTitle = String(variant.title || '').trim().toLowerCase();
 
                             const isMatch = (soldBarcode && variantBarcode && variantBarcode === soldBarcode) ||
-                                            (soldTitle && variantTitle && variantTitle === soldTitle) ||
-                                            (product.variants.length === 1);
+                                (soldTitle && variantTitle && variantTitle === soldTitle) ||
+                                (product.variants.length === 1);
 
                             if (!isMatch) return variant;
 
@@ -383,7 +383,7 @@ async function connectToMongoDB() {
                                         const im1 = typeof bi === 'object' ? (bi.imei1 || '') : String(bi || '');
                                         const im2 = typeof bi === 'object' ? (bi.imei2 || '') : '';
                                         return (!im1 || !soldImeiSet.has(im1.trim().toLowerCase())) &&
-                                               (!im2 || !soldImeiSet.has(im2.trim().toLowerCase()));
+                                            (!im2 || !soldImeiSet.has(im2.trim().toLowerCase()));
                                     });
                                 }
 
@@ -401,7 +401,7 @@ async function connectToMongoDB() {
                                     const im1 = typeof bi === 'object' ? (bi.imei1 || '') : String(bi || '');
                                     const im2 = typeof bi === 'object' ? (bi.imei2 || '') : '';
                                     return (!im1 || !soldImeiSet.has(im1.trim().toLowerCase())) &&
-                                           (!im2 || !soldImeiSet.has(im2.trim().toLowerCase()));
+                                        (!im2 || !soldImeiSet.has(im2.trim().toLowerCase()));
                                 });
                             }
 
@@ -508,6 +508,49 @@ async function connectToMongoDB() {
             } catch (err) {
                 console.error("Error creating category:", err);
                 res.status(500).send({ message: "Failed to create category" });
+            }
+        });
+
+        // DELETE /category/:id -> Delete a category only if no products are assigned to it
+        app.delete("/category/:id", async (req, res) => {
+            try {
+                const { id } = req.params;
+
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).send({ message: "Invalid category ID format" });
+                }
+
+                // 1. Verify category exists
+                const category = await categoryCollection.findOne({ _id: new ObjectId(id) });
+                if (!category) {
+                    return res.status(404).send({ message: "Category not found" });
+                }
+
+                // 2. Check if any products reference this category (by String ID, ObjectId, or name)
+                const categoryMatch = [
+                    { category: id },
+                    { category: new ObjectId(id) }
+                ];
+                if (category.name) {
+                    categoryMatch.push({ category: category.name });
+                }
+
+                const assignedProductsCount = await productCollection.countDocuments({
+                    $or: categoryMatch
+                });
+
+                if (assignedProductsCount > 0) {
+                    return res.status(400).send({
+                        message: `Cannot delete category: ${assignedProductsCount} product(s) are assigned to this category. Please reassign or delete them first.`
+                    });
+                }
+
+                // 3. Delete the category once confirmed safe
+                const result = await categoryCollection.deleteOne({ _id: new ObjectId(id) });
+                res.send(result);
+            } catch (err) {
+                console.error("Error deleting category:", err);
+                res.status(500).send({ message: "Failed to delete category" });
             }
         });
 
