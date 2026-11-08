@@ -32,6 +32,242 @@ async function connectToMongoDB() {
         // Ensure unique index on invoiceNo to guarantee mathematical non-duplication
         salesCollection.createIndex({ invoiceNo: 1 }, { unique: true }).catch(err => console.error("Error creating sales invoice index:", err));
 
+        salesCollection.createIndex({ createdAt: -1 }).catch(() => {});
+        salesCollection.createIndex({ paymentStatus: 1 }).catch(() => {});
+        salesCollection.createIndex({ paymentMethod: 1 }).catch(() => {});
+        salesCollection.createIndex({ totalPayable: 1 }).catch(() => {});
+
+        // GET /sales/report -> High performance aggregation API for sales report, filters, stats, & pagination
+        app.get("/sales/report", async (req, res) => {
+            try {
+                const {
+                    search,
+                    startDate,
+                    endDate,
+                    paymentStatus,
+                    paymentMethod,
+                    orderStatus,
+                    returnStatus,
+                    minAmount,
+                    maxAmount,
+                    category,
+                    page,
+                    limit,
+                    sortBy,
+                    sortOrder
+                } = req.query;
+
+                const andConditions = [];
+                let hasActiveFilters = false;
+
+                // 1. Date range filter on createdAt / saleDate
+                if (startDate || endDate) {
+                    hasActiveFilters = true;
+                    const dateQuery = {};
+                    const isoQuery = {};
+                    if (startDate) {
+                        const s = new Date(startDate);
+                        s.setHours(0, 0, 0, 0);
+                        dateQuery.$gte = s;
+                        isoQuery.$gte = s.toISOString();
+                    }
+                    if (endDate) {
+                        const e = new Date(endDate);
+                        e.setHours(23, 59, 59, 999);
+                        dateQuery.$lte = e;
+                        isoQuery.$lte = e.toISOString();
+                    }
+                    andConditions.push({
+                        $or: [
+                            { createdAt: dateQuery },
+                            { saleDate: isoQuery }
+                        ]
+                    });
+                }
+
+                // 2. Search query filter
+                if (search && search.trim()) {
+                    hasActiveFilters = true;
+                    const clean = search.trim();
+                    const regex = new RegExp(clean.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+                    andConditions.push({
+                        $or: [
+                            { invoiceNo: regex },
+                            { "customer.name": regex },
+                            { "customer.phone": regex },
+                            { "items.name": regex },
+                            { "items.brand": regex },
+                            { "items.model": regex },
+                            { "items.barcode": regex },
+                            { "items.imeis.imei1": regex },
+                            { "items.imeis.imei2": regex }
+                        ]
+                    });
+                }
+
+                // 3. Payment Status filter
+                if (paymentStatus && paymentStatus !== 'all') {
+                    hasActiveFilters = true;
+                    andConditions.push({ paymentStatus: paymentStatus.toLowerCase() });
+                }
+
+                // 4. Payment Method filter
+                if (paymentMethod && paymentMethod !== 'all') {
+                    hasActiveFilters = true;
+                    andConditions.push({ paymentMethod: new RegExp(`^${paymentMethod}$`, 'i') });
+                }
+
+                // 5. Order Status filter
+                if (orderStatus && orderStatus !== 'all') {
+                    hasActiveFilters = true;
+                    andConditions.push({ orderStatus: orderStatus.toLowerCase() });
+                }
+
+                // 6. Return Status filter
+                if (returnStatus && returnStatus !== 'all') {
+                    hasActiveFilters = true;
+                    andConditions.push({ returnStatus: returnStatus.toLowerCase() });
+                }
+
+                // 7. Amount Range (totalPayable)
+                if (minAmount !== undefined && minAmount !== '' && !isNaN(Number(minAmount))) {
+                    hasActiveFilters = true;
+                    andConditions.push({ totalPayable: { $gte: Number(minAmount) } });
+                }
+                if (maxAmount !== undefined && maxAmount !== '' && !isNaN(Number(maxAmount))) {
+                    hasActiveFilters = true;
+                    andConditions.push({ totalPayable: { $lte: Number(maxAmount) } });
+                }
+
+                // 8. Category filter
+                if (category && category !== 'all') {
+                    hasActiveFilters = true;
+                    andConditions.push({ "items.category": category });
+                }
+
+                const matchQuery = andConditions.length > 0 ? { $and: andConditions } : {};
+
+                // Pagination & Sorting setup
+                const pageNum = Math.max(1, parseInt(page, 10) || 1);
+                const limitNum = Math.max(1, Math.min(200, parseInt(limit, 10) || 10));
+                const skipNum = (pageNum - 1) * limitNum;
+
+                const allowedSortFields = ['createdAt', 'totalPayable', 'paidAmount', 'dueAmount', 'totalCartItems'];
+                const sortField = allowedSortFields.includes(sortBy) ? sortBy : 'createdAt';
+                const sortDirection = sortOrder === 'asc' ? 1 : -1;
+
+                // High-performance aggregation pipeline with $facet
+                const pipeline = [
+                    { $match: matchQuery },
+                    {
+                        $facet: {
+                            summary: [
+                                {
+                                    $group: {
+                                        _id: null,
+                                        totalRevenue: { $sum: { $ifNull: ["$totalPayable", 0] } },
+                                        totalCollection: { $sum: { $ifNull: ["$paidAmount", 0] } },
+                                        totalDue: { $sum: { $ifNull: ["$dueAmount", 0] } },
+                                        totalSubtotal: { $sum: { $ifNull: ["$subtotal", 0] } },
+                                        totalDiscount: { $sum: { $ifNull: ["$discountAmount", 0] } },
+                                        totalDeliveryFee: { $sum: { $ifNull: ["$deliveryFee", 0] } },
+                                        totalItemsSold: { $sum: { $ifNull: ["$totalCartItems", 0] } },
+                                        totalOrders: { $sum: 1 }
+                                    }
+                                }
+                            ],
+                            sales: [
+                                { $sort: { [sortField]: sortDirection } },
+                                { $skip: skipNum },
+                                { $limit: limitNum }
+                            ]
+                        }
+                    }
+                ];
+
+                // Overall lifetime summary (unfiltered stats) for baseline/comparison
+                const overallPipeline = [
+                    {
+                        $group: {
+                            _id: null,
+                            totalRevenue: { $sum: { $ifNull: ["$totalPayable", 0] } },
+                            totalCollection: { $sum: { $ifNull: ["$paidAmount", 0] } },
+                            totalDue: { $sum: { $ifNull: ["$dueAmount", 0] } },
+                            totalSubtotal: { $sum: { $ifNull: ["$subtotal", 0] } },
+                            totalDiscount: { $sum: { $ifNull: ["$discountAmount", 0] } },
+                            totalDeliveryFee: { $sum: { $ifNull: ["$deliveryFee", 0] } },
+                            totalItemsSold: { $sum: { $ifNull: ["$totalCartItems", 0] } },
+                            totalOrders: { $sum: 1 }
+                        }
+                    }
+                ];
+
+                const [facetResult, overallResult] = await Promise.all([
+                    salesCollection.aggregate(pipeline).toArray(),
+                    salesCollection.aggregate(overallPipeline).toArray()
+                ]);
+
+                const facetData = facetResult[0] || { summary: [], sales: [] };
+                const defaultSummary = {
+                    totalRevenue: 0,
+                    totalCollection: 0,
+                    totalDue: 0,
+                    totalSubtotal: 0,
+                    totalDiscount: 0,
+                    totalDeliveryFee: 0,
+                    totalItemsSold: 0,
+                    totalOrders: 0
+                };
+
+                const filteredStats = facetData.summary[0] || defaultSummary;
+                const overallStats = overallResult[0] || defaultSummary;
+
+                const totalOrdersCount = filteredStats.totalOrders;
+                const totalPages = Math.ceil(totalOrdersCount / limitNum) || 1;
+
+                res.send({
+                    success: true,
+                    sales: facetData.sales,
+                    filteredStats,
+                    overallStats,
+                    pagination: {
+                        totalCount: totalOrdersCount,
+                        totalPages,
+                        currentPage: pageNum,
+                        limit: limitNum,
+                        hasNextPage: pageNum < totalPages,
+                        hasPrevPage: pageNum > 1
+                    },
+                    isFiltered: hasActiveFilters
+                });
+            } catch (err) {
+                console.error("Error generating sales report:", err);
+                res.status(500).send({ message: "Failed to generate sales report" });
+            }
+        });
+
+        // GET /sales/:id -> Retrieve complete single sale details by ObjectId or invoiceNo
+        app.get("/sales/:id", async (req, res) => {
+            try {
+                const { id } = req.params;
+                let query;
+                if (ObjectId.isValid(id)) {
+                    query = { $or: [{ _id: new ObjectId(id) }, { invoiceNo: id }] };
+                } else {
+                    query = { invoiceNo: id };
+                }
+                const sale = await salesCollection.findOne(query);
+                if (!sale) {
+                    return res.status(404).send({ message: "Sale record not found" });
+                }
+                res.send(sale);
+            } catch (err) {
+                console.error("Error fetching sale details:", err);
+                res.status(500).send({ message: "Failed to fetch sale details" });
+            }
+        });
+
+
         // ====================================================================================================
         // * ------------------------------------------- Sales APIs  ------------------------------------------
         // ====================================================================================================
@@ -55,16 +291,14 @@ async function connectToMongoDB() {
                     return res.status(400).send({ message: "Sale must include at least one item." });
                 }
 
-                // 1. Generate unique invoice number with uppercase A-Z and digits 0-9 using crypto
+                // 1. Generate unique invoice number: "IN-" prefix + 5 crypto characters (e.g. IN-EUCUC)
                 function generateInvoiceNo() {
                     const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-                    const bytes = crypto.randomBytes(6);
                     let randomCode = '';
-                    for (let i = 0; i < bytes.length; i++) {
-                        randomCode += chars[bytes[i] % chars.length];
+                    for (let i = 0; i < 5; i++) {
+                        randomCode += chars[crypto.randomInt(0, chars.length)];
                     }
-                    const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-                    return `INV-${dateStr}-${randomCode}`;
+                    return `IN-${randomCode}`;
                 }
 
                 saleData.invoiceNo = generateInvoiceNo();
