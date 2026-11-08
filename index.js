@@ -1,5 +1,6 @@
-﻿const express = require('express');
+const express = require('express');
 const { MongoClient, ObjectId } = require('mongodb');
+const crypto = require('crypto');
 const cors = require('cors');
 const app = express();
 const port = 5000;
@@ -26,6 +27,214 @@ async function connectToMongoDB() {
         const productCollection = db.collection("products");
         const purchaseCollection = db.collection("purchases");
         const supplierCollection = db.collection("suppliers");
+        const salesCollection = db.collection('sales');
+
+        // Ensure unique index on invoiceNo to guarantee mathematical non-duplication
+        salesCollection.createIndex({ invoiceNo: 1 }, { unique: true }).catch(err => console.error("Error creating sales invoice index:", err));
+
+        // ====================================================================================================
+        // * ------------------------------------------- Sales APIs  ------------------------------------------
+        // ====================================================================================================
+
+        // GET /sales -> Retrieve all completed sales records sorted by latest date
+        app.get("/sales", async (req, res) => {
+            try {
+                const result = await salesCollection.find().sort({ createdAt: -1 }).toArray();
+                res.send(result);
+            } catch (err) {
+                console.error("Error fetching sales:", err);
+                res.status(500).send({ message: "Failed to fetch sales" });
+            }
+        });
+
+        // POST /sale -> Record sale invoice with non-duplicate crypto invoice ID, deduct variant stock, FIFO batches & IMEIs
+        app.post("/sale", async (req, res) => {
+            try {
+                const saleData = req.body;
+                if (!saleData || !Array.isArray(saleData.items) || saleData.items.length === 0) {
+                    return res.status(400).send({ message: "Sale must include at least one item." });
+                }
+
+                // 1. Generate unique invoice number with uppercase A-Z and digits 0-9 using crypto
+                function generateInvoiceNo() {
+                    const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+                    const bytes = crypto.randomBytes(6);
+                    let randomCode = '';
+                    for (let i = 0; i < bytes.length; i++) {
+                        randomCode += chars[bytes[i] % chars.length];
+                    }
+                    const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+                    return `INV-${dateStr}-${randomCode}`;
+                }
+
+                saleData.invoiceNo = generateInvoiceNo();
+                saleData.createdAt = new Date();
+                saleData.updatedAt = new Date();
+
+                // Helper to normalize and extract IMEI strings for comparison
+                function extractImeiStrings(imeiArray) {
+                    if (!Array.isArray(imeiArray)) return [];
+                    const list = [];
+                    for (const item of imeiArray) {
+                        if (typeof item === 'object' && item !== null) {
+                            if (item.imei1) list.push(String(item.imei1).trim().toLowerCase());
+                            if (item.imei2) list.push(String(item.imei2).trim().toLowerCase());
+                            if (item.imei) list.push(String(item.imei).trim().toLowerCase());
+                        } else if (typeof item === 'string' && item.trim()) {
+                            list.push(item.trim().toLowerCase());
+                        }
+                    }
+                    return list;
+                }
+
+                // 2. Deduct inventory (variant quantity, FIFO batches, and IMEIs) via high-performance Batch & bulkWrite
+                const uniqueProductIds = [
+                    ...new Set(
+                        saleData.items
+                            .map((item) => item.productId)
+                            .filter((id) => id && ObjectId.isValid(id))
+                    )
+                ].map((id) => new ObjectId(id));
+
+                if (uniqueProductIds.length > 0) {
+                    // Single network call to fetch all products in the cart (lightweight projection)
+                    const fetchedProducts = await productCollection
+                        .find(
+                            { _id: { $in: uniqueProductIds } },
+                            { projection: { variants: 1, hasImei: 1 } }
+                        )
+                        .toArray();
+
+                    const productMap = new Map(fetchedProducts.map((p) => [p._id.toString(), p]));
+
+                    // Process item deductions in-memory
+                    for (const soldItem of saleData.items) {
+                        if (!soldItem.productId) continue;
+                        const product = productMap.get(soldItem.productId.toString());
+                        if (!product || !Array.isArray(product.variants) || product.variants.length === 0) continue;
+
+                        const soldQty = Number(soldItem.quantity) || 1;
+                        const soldImeiSet = new Set(extractImeiStrings(soldItem.imeis));
+
+                        product.variants = product.variants.map((variant) => {
+                            const soldBarcode = String(soldItem.barcode || '').trim().toLowerCase();
+                            const soldTitle = String(soldItem.variantTitle || '').trim().toLowerCase();
+                            const variantBarcode = String(variant.barcode || '').trim().toLowerCase();
+                            const variantTitle = String(variant.title || '').trim().toLowerCase();
+
+                            const isMatch = (soldBarcode && variantBarcode && variantBarcode === soldBarcode) ||
+                                            (soldTitle && variantTitle && variantTitle === soldTitle) ||
+                                            (product.variants.length === 1);
+
+                            if (!isMatch) return variant;
+
+                            // A. Deduct total quantity
+                            const newQuantity = Math.max(0, (Number(variant.quantity) || 0) - soldQty);
+
+                            // B. Deduct from FIFO batches
+                            let qtyToDeduct = soldQty;
+                            const updatedBatches = (variant.batches || []).map((batch) => {
+                                if (qtyToDeduct <= 0) return batch;
+                                const available = Number(batch.remainingQuantity) || 0;
+                                if (available <= 0) return batch;
+
+                                const deducted = Math.min(available, qtyToDeduct);
+                                qtyToDeduct -= deducted;
+                                const newRemaining = available - deducted;
+
+                                // If batch tracks IMEIs, filter out the sold IMEIs
+                                let batchImeis = batch.imeis;
+                                if (Array.isArray(batchImeis) && soldImeiSet.size > 0) {
+                                    batchImeis = batchImeis.filter((bi) => {
+                                        const im1 = typeof bi === 'object' ? (bi.imei1 || '') : String(bi || '');
+                                        const im2 = typeof bi === 'object' ? (bi.imei2 || '') : '';
+                                        return (!im1 || !soldImeiSet.has(im1.trim().toLowerCase())) &&
+                                               (!im2 || !soldImeiSet.has(im2.trim().toLowerCase()));
+                                    });
+                                }
+
+                                return {
+                                    ...batch,
+                                    remainingQuantity: newRemaining,
+                                    ...(batchImeis !== undefined ? { imeis: batchImeis } : {})
+                                };
+                            });
+
+                            // C. Remove sold IMEIs from variant.imeis
+                            let remainingImeis = variant.imeis;
+                            if (Array.isArray(remainingImeis) && soldImeiSet.size > 0) {
+                                remainingImeis = remainingImeis.filter((bi) => {
+                                    const im1 = typeof bi === 'object' ? (bi.imei1 || '') : String(bi || '');
+                                    const im2 = typeof bi === 'object' ? (bi.imei2 || '') : '';
+                                    return (!im1 || !soldImeiSet.has(im1.trim().toLowerCase())) &&
+                                           (!im2 || !soldImeiSet.has(im2.trim().toLowerCase()));
+                                });
+                            }
+
+                            return {
+                                ...variant,
+                                quantity: newQuantity,
+                                batches: updatedBatches,
+                                imeis: remainingImeis,
+                                updatedAt: new Date()
+                            };
+                        });
+                    }
+
+                    // Package into 1 single bulkWrite network request
+                    const bulkOperations = [];
+                    for (const product of productMap.values()) {
+                        const totalStock = product.variants.reduce((sum, v) => sum + (Number(v.quantity) || 0), 0);
+                        bulkOperations.push({
+                            updateOne: {
+                                filter: { _id: product._id },
+                                update: {
+                                    $set: {
+                                        variants: product.variants,
+                                        quantity: totalStock,
+                                        updatedAt: new Date()
+                                    }
+                                }
+                            }
+                        });
+                    }
+
+                    if (bulkOperations.length > 0) {
+                        await productCollection.bulkWrite(bulkOperations, { ordered: false });
+                    }
+                }
+
+                // 3. Save sale invoice record in salesCollection (with duplicate retry safety)
+                let result;
+                try {
+                    result = await salesCollection.insertOne(saleData);
+                } catch (insertErr) {
+                    if (insertErr.code === 11000) {
+                        delete saleData._id;
+                        saleData.invoiceNo = generateInvoiceNo();
+                        result = await salesCollection.insertOne(saleData);
+                    } else {
+                        throw insertErr;
+                    }
+                }
+
+                // 4. Return invoice details for frontend toast & print receipt modal
+                res.send({
+                    success: true,
+                    insertedId: result.insertedId,
+                    invoiceNo: saleData.invoiceNo,
+                    // sale: saleData
+                });
+            } catch (err) {
+                console.error("Error processing sale:", err);
+                res.status(500).send({ message: "Failed to process sale" });
+            }
+        });
+
+
+
+
+
 
         // ====================================================================================================
         // * ------------------------------------ CATEGORY APIs (categories) ------------------------------------
@@ -370,7 +579,7 @@ async function connectToMongoDB() {
                 const matchedImeiObj = Array.isArray(variant.imeis) && variant.imeis.find(item => {
                     if (typeof item === 'object' && item !== null) {
                         return (item.imei1 && item.imei1.toLowerCase() === cleanId.toLowerCase()) ||
-                               (item.imei2 && item.imei2.toLowerCase() === cleanId.toLowerCase());
+                            (item.imei2 && item.imei2.toLowerCase() === cleanId.toLowerCase());
                     }
                     return String(item || '').toLowerCase() === cleanId.toLowerCase();
                 });
