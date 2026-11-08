@@ -41,6 +41,11 @@ async function connectToMongoDB() {
         productCollection.createIndex({ category: 1 }).catch(() => { });
         categoryCollection.createIndex({ createdAt: -1 }).catch(() => { });
 
+        // Supplier & Purchase indexes for fast relational lookup, purchase linking, and sort
+        supplierCollection.createIndex({ createdAt: -1 }).catch(() => { });
+        purchaseCollection.createIndex({ supplierId: 1 }).catch(() => { });
+        productCollection.createIndex({ "variants.batches.supplierId": 1 }).catch(() => { });
+
         // GET /sales/report -> High performance aggregation API for sales report, filters, stats, & pagination
         app.get("/sales/report", async (req, res) => {
             try {
@@ -607,6 +612,52 @@ async function connectToMongoDB() {
             } catch (err) {
                 console.error("Error creating category:", err);
                 res.status(500).send({ message: "Failed to create category" });
+            }
+        });
+
+        // PUT /category/:id -> Update an existing category by ObjectId
+        app.put("/category/:id", async (req, res) => {
+            try {
+                const { id } = req.params;
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).send({ message: "Invalid category ID format" });
+                }
+
+                const { name, description } = req.body;
+                if (!name || !name.trim()) {
+                    return res.status(400).send({ message: "Category name is required" });
+                }
+
+                const existingCategory = await categoryCollection.findOne({ _id: new ObjectId(id) });
+                if (!existingCategory) {
+                    return res.status(404).send({ message: "Category not found" });
+                }
+
+                const trimmedName = name.trim();
+                const trimmedDesc = (description || "").trim();
+
+                const updateDoc = {
+                    $set: {
+                        name: trimmedName,
+                        description: trimmedDesc,
+                        updatedAt: new Date()
+                    }
+                };
+
+                const result = await categoryCollection.updateOne({ _id: new ObjectId(id) }, updateDoc);
+
+                // If category name changed, update product references that store category by name
+                if (existingCategory.name && existingCategory.name !== trimmedName) {
+                    await productCollection.updateMany(
+                        { category: existingCategory.name },
+                        { $set: { category: trimmedName } }
+                    ).catch(err => console.error("Error syncing product category name references:", err));
+                }
+
+                res.send(result);
+            } catch (err) {
+                console.error("Error updating category:", err);
+                res.status(500).send({ message: "Failed to update category" });
             }
         });
 
@@ -1279,10 +1330,153 @@ async function connectToMongoDB() {
         // * ------------------------------------ SUPPLIER APIs (suppliers) -------------------------------------
         // ====================================================================================================
 
-        // GET /suppliers -> Retrieve all registered suppliers with complete contact and address details
+        // GET /suppliers -> High-performance aggregation pipeline retrieving suppliers with product counts, stock metrics, & live search
         app.get("/suppliers", async (req, res) => {
             try {
-                const result = await supplierCollection.find().toArray();
+                const { search, q } = req.query;
+                const searchQuery = (search || q || "").trim();
+
+                const pipeline = [];
+
+                if (searchQuery) {
+                    const regex = new RegExp(searchQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+                    pipeline.push({
+                        $match: {
+                            $or: [
+                                { name: regex },
+                                { contactPerson: regex },
+                                { phone: regex },
+                                { email: regex },
+                                { address: regex }
+                            ]
+                        }
+                    });
+                }
+
+                pipeline.push(
+                    {
+                        $lookup: {
+                            from: "products",
+                            let: { supIdStr: { $toString: "$_id" }, supId: "$_id", supName: "$name" },
+                            pipeline: [
+                                {
+                                    $match: {
+                                        $expr: {
+                                            $or: [
+                                                { $in: ["$$supIdStr", { $ifNull: ["$variants.batches.supplierId", []] }] },
+                                                { $in: ["$$supId", { $ifNull: ["$variants.batches.supplierId", []] }] },
+                                                { $and: [{ $ne: ["$$supName", null] }, { $ne: ["$$supName", ""] }, { $in: ["$$supName", { $ifNull: ["$variants.batches.supplier", []] }] }] }
+                                            ]
+                                        }
+                                    }
+                                },
+                                {
+                                    $project: {
+                                        _id: 1,
+                                        stockFromSupplier: {
+                                            $reduce: {
+                                                input: {
+                                                    $reduce: {
+                                                        input: { $ifNull: ["$variants", []] },
+                                                        initialValue: [],
+                                                        in: { $concatArrays: ["$$value", { $ifNull: ["$$this.batches", []] }] }
+                                                    }
+                                                },
+                                                initialValue: 0,
+                                                in: {
+                                                    $cond: [
+                                                        {
+                                                            $or: [
+                                                                { $eq: ["$$this.supplierId", "$$supIdStr"] },
+                                                                { $eq: ["$$this.supplierId", "$$supId"] },
+                                                                { $eq: ["$$this.supplier", "$$supName"] }
+                                                            ]
+                                                        },
+                                                        { $add: ["$$value", { $toDouble: { $ifNull: ["$$this.remainingQuantity", 0] } }] },
+                                                        "$$value"
+                                                    ]
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                {
+                                    $group: {
+                                        _id: null,
+                                        productsCount: { $sum: 1 },
+                                        totalStock: { $sum: "$stockFromSupplier" }
+                                    }
+                                }
+                            ],
+                            as: "productStats"
+                        }
+                    },
+                    {
+                        $lookup: {
+                            from: "purchases",
+                            let: { supIdStr: { $toString: "$_id" }, supId: "$_id", supName: "$name" },
+                            pipeline: [
+                                {
+                                    $match: {
+                                        $expr: {
+                                            $or: [
+                                                { $eq: ["$supplierId", "$$supIdStr"] },
+                                                { $eq: ["$supplierId", "$$supId"] },
+                                                { $and: [{ $ne: ["$$supName", null] }, { $ne: ["$$supName", ""] }, { $eq: ["$supplier", "$$supName"] }] },
+                                                { $and: [{ $ne: ["$$supName", null] }, { $ne: ["$$supName", ""] }, { $eq: ["$supplierName", "$$supName"] }] }
+                                            ]
+                                        }
+                                    }
+                                },
+                                {
+                                    $group: {
+                                        _id: null,
+                                        purchasesCount: { $sum: 1 },
+                                        distinctProducts: { $addToSet: "$productId" }
+                                    }
+                                }
+                            ],
+                            as: "purchaseStats"
+                        }
+                    },
+                    {
+                        $addFields: {
+                            pStats: { $arrayElemAt: ["$productStats", 0] },
+                            purStats: { $arrayElemAt: ["$purchaseStats", 0] }
+                        }
+                    },
+                    {
+                        $addFields: {
+                            productsCount: {
+                                $max: [
+                                    { $ifNull: ["$pStats.productsCount", 0] },
+                                    { $size: { $ifNull: ["$purStats.distinctProducts", []] } }
+                                ]
+                            },
+                            totalProducts: {
+                                $max: [
+                                    { $ifNull: ["$pStats.productsCount", 0] },
+                                    { $size: { $ifNull: ["$purStats.distinctProducts", []] } }
+                                ]
+                            },
+                            totalStock: { $ifNull: ["$pStats.totalStock", 0] },
+                            purchasesCount: { $ifNull: ["$purStats.purchasesCount", 0] }
+                        }
+                    },
+                    {
+                        $project: {
+                            productStats: 0,
+                            purchaseStats: 0,
+                            pStats: 0,
+                            purStats: 0
+                        }
+                    },
+                    {
+                        $sort: { createdAt: -1, _id: -1 }
+                    }
+                );
+
+                const result = await supplierCollection.aggregate(pipeline).toArray();
                 res.send(result);
             } catch (err) {
                 console.error("Error fetching suppliers:", err);
@@ -1290,11 +1484,18 @@ async function connectToMongoDB() {
             }
         });
 
-        // GET /suppliers/names -> Retrieve supplier names and IDs only (lightweight for purchase dropdown menus)
+        // GET /suppliers/names -> Retrieve supplier names and IDs only with optional search (lightweight for purchase dropdown menus)
         app.get("/suppliers/names", async (req, res) => {
             try {
+                const { search, q } = req.query;
+                const searchQuery = (search || q || "").trim();
+                const query = {};
+                if (searchQuery) {
+                    const regex = new RegExp(searchQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+                    query.$or = [{ name: regex }, { contactPerson: regex }, { phone: regex }];
+                }
                 const projection = { projection: { name: 1 } };
-                const result = await supplierCollection.find({}, projection).toArray();
+                const result = await supplierCollection.find(query, projection).toArray();
                 res.send(result);
             } catch (err) {
                 console.error("Error fetching supplier names:", err);
@@ -1324,19 +1525,41 @@ async function connectToMongoDB() {
                     return res.status(400).send({ message: "Invalid supplier ID format" });
                 }
                 const data = req.body;
+                if (!data.name || !data.name.trim()) {
+                    return res.status(400).send({ message: "Supplier name is required" });
+                }
+                if (!data.phone || !data.phone.trim()) {
+                    return res.status(400).send({ message: "Phone number is required" });
+                }
+
+                const existingSupplier = await supplierCollection.findOne({ _id: new ObjectId(id) });
+                if (!existingSupplier) {
+                    return res.status(404).send({ message: "Supplier not found" });
+                }
+
+                const trimmedName = data.name.trim();
                 const query = { _id: new ObjectId(id) };
                 const updateDoc = {
                     $set: {
-                        name: data.name,
-                        phone: data.phone,
-                        contactPerson: data.contactPerson,
-                        address: data.address,
-                        email: data.email,
-                        notes: data.notes,
+                        name: trimmedName,
+                        phone: data.phone.trim(),
+                        contactPerson: (data.contactPerson || "").trim(),
+                        address: (data.address || "").trim(),
+                        email: (data.email || "").trim(),
+                        notes: (data.notes || "").trim(),
                         updatedAt: new Date()
                     }
                 };
                 const result = await supplierCollection.updateOne(query, updateDoc);
+
+                // If supplier name changed, sync purchase records referencing this supplier
+                if (existingSupplier.name && existingSupplier.name !== trimmedName) {
+                    await purchaseCollection.updateMany(
+                        { $or: [{ supplierId: id }, { supplierId: new ObjectId(id) }, { supplier: existingSupplier.name }] },
+                        { $set: { supplier: trimmedName, supplierName: trimmedName } }
+                    ).catch(err => console.error("Error syncing purchase supplier references:", err));
+                }
+
                 res.send(result);
             } catch (err) {
                 console.error("Error updating supplier:", err);
@@ -1344,15 +1567,59 @@ async function connectToMongoDB() {
             }
         });
 
-        // DELETE /supplier/:id -> Permanently remove a supplier profile by supplier ObjectId
+        // DELETE /supplier/:id -> Delete a supplier only if no products or purchases are linked to this supplier
         app.delete("/supplier/:id", async (req, res) => {
             try {
                 const { id } = req.params;
                 if (!ObjectId.isValid(id)) {
                     return res.status(400).send({ message: "Invalid supplier ID format" });
                 }
-                const query = { _id: new ObjectId(id) };
-                const result = await supplierCollection.deleteOne(query);
+
+                // 1. Verify supplier exists
+                const supplier = await supplierCollection.findOne({ _id: new ObjectId(id) });
+                if (!supplier) {
+                    return res.status(404).send({ message: "Supplier not found" });
+                }
+
+                // 2. Check if products in inventory were brought from this supplier (via batches)
+                const supplierBatchMatches = [
+                    { "variants.batches.supplierId": id },
+                    { "variants.batches.supplierId": new ObjectId(id) }
+                ];
+                if (supplier.name) {
+                    supplierBatchMatches.push({ "variants.batches.supplier": supplier.name });
+                }
+
+                // 3. Check if any purchase records exist for this supplier
+                const purchaseMatches = [
+                    { supplierId: id },
+                    { supplierId: new ObjectId(id) }
+                ];
+                if (supplier.name) {
+                    purchaseMatches.push({ supplier: supplier.name });
+                    purchaseMatches.push({ supplierName: supplier.name });
+                }
+
+                const [assignedProductsCount, purchasesCount] = await Promise.all([
+                    productCollection.countDocuments({ $or: supplierBatchMatches }),
+                    purchaseCollection.countDocuments({ $or: purchaseMatches })
+                ]);
+
+                if (assignedProductsCount > 0 || purchasesCount > 0) {
+                    const reasons = [];
+                    if (assignedProductsCount > 0) {
+                        reasons.push(`${assignedProductsCount} product(s) in catalog`);
+                    }
+                    if (purchasesCount > 0) {
+                        reasons.push(`${purchasesCount} purchase invoice(s)`);
+                    }
+                    return res.status(400).send({
+                        message: `Cannot delete supplier: ${reasons.join(" and ")} were brought from "${supplier.name}". Please reassign or delete these records first.`
+                    });
+                }
+
+                // 4. Safe to delete
+                const result = await supplierCollection.deleteOne({ _id: new ObjectId(id) });
                 res.send(result);
             } catch (err) {
                 console.error("Error deleting supplier:", err);
