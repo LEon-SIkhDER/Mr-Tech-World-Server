@@ -478,10 +478,29 @@ async function connectToMongoDB() {
         // * ------------------------------------ CATEGORY APIs (categories) ------------------------------------
         // ====================================================================================================
 
-        // GET /categories -> High-performance aggregation pipeline returning categories with product counts and stock metrics
+        // GET /categories -> High-performance aggregation pipeline returning categories with product counts, stock metrics, & live search
         app.get("/categories", async (req, res) => {
             try {
-                const pipeline = [
+                const { search, q } = req.query;
+                const searchQuery = (search || q || "").trim();
+
+                const pipeline = [];
+
+                // 1. Initial filter stage for search query (runs first to optimize performance before lookup)
+                if (searchQuery) {
+                    const regex = new RegExp(searchQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+                    pipeline.push({
+                        $match: {
+                            $or: [
+                                { name: regex },
+                                { description: regex }
+                            ]
+                        }
+                    });
+                }
+
+                // 2. High-performance lookup & inventory metrics calculation
+                pipeline.push(
                     {
                         $lookup: {
                             from: "products",
@@ -548,7 +567,7 @@ async function connectToMongoDB() {
                     {
                         $sort: { createdAt: -1, _id: -1 }
                     }
-                ];
+                );
 
                 const result = await categoryCollection.aggregate(pipeline).toArray();
                 res.send(result);
@@ -558,11 +577,18 @@ async function connectToMongoDB() {
             }
         });
 
-        // GET /categories/names -> Retrieve category names and IDs only (lightweight for dropdown select menus)
+        // GET /categories/names -> Retrieve category names and IDs only with optional search (lightweight for dropdown select menus)
         app.get("/categories/names", async (req, res) => {
             try {
+                const { search, q } = req.query;
+                const searchQuery = (search || q || "").trim();
+                const query = {};
+                if (searchQuery) {
+                    const regex = new RegExp(searchQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+                    query.$or = [{ name: regex }, { description: regex }];
+                }
                 const projection = { projection: { name: 1 } };
-                const result = await categoryCollection.find({}, projection).toArray();
+                const result = await categoryCollection.find(query, projection).toArray();
                 res.send(result);
             } catch (err) {
                 console.error("Error fetching category names:", err);
