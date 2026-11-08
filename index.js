@@ -37,6 +37,10 @@ async function connectToMongoDB() {
         salesCollection.createIndex({ paymentMethod: 1 }).catch(() => { });
         salesCollection.createIndex({ totalPayable: 1 }).catch(() => { });
 
+        // Category & Product indexes for fast relational lookup and sort
+        productCollection.createIndex({ category: 1 }).catch(() => { });
+        categoryCollection.createIndex({ createdAt: -1 }).catch(() => { });
+
         // GET /sales/report -> High performance aggregation API for sales report, filters, stats, & pagination
         app.get("/sales/report", async (req, res) => {
             try {
@@ -474,10 +478,79 @@ async function connectToMongoDB() {
         // * ------------------------------------ CATEGORY APIs (categories) ------------------------------------
         // ====================================================================================================
 
-        // GET /categories -> Retrieve all category documents from the categories collection
+        // GET /categories -> High-performance aggregation pipeline returning categories with product counts and stock metrics
         app.get("/categories", async (req, res) => {
             try {
-                const result = await categoryCollection.find().toArray();
+                const pipeline = [
+                    {
+                        $lookup: {
+                            from: "products",
+                            let: { catIdStr: { $toString: "$_id" }, catId: "$_id", catName: "$name" },
+                            pipeline: [
+                                {
+                                    $match: {
+                                        $expr: {
+                                            $or: [
+                                                { $and: [{ $ne: ["$$catIdStr", null] }, { $eq: ["$category", "$$catIdStr"] }] },
+                                                { $and: [{ $ne: ["$$catId", null] }, { $eq: ["$category", "$$catId"] }] },
+                                                { $and: [{ $ne: ["$$catName", null] }, { $ne: ["$$catName", ""] }, { $eq: ["$category", "$$catName"] }] }
+                                            ]
+                                        }
+                                    }
+                                },
+                                {
+                                    $project: {
+                                        _id: 1,
+                                        stock: {
+                                            $cond: [
+                                                { $gt: [{ $size: { $ifNull: ["$variants", []] } }, 0] },
+                                                {
+                                                    $reduce: {
+                                                        input: { $ifNull: ["$variants", []] },
+                                                        initialValue: 0,
+                                                        in: { $add: ["$$value", { $toDouble: { $ifNull: ["$$this.quantity", 0] } }] }
+                                                    }
+                                                },
+                                                { $toDouble: { $ifNull: ["$quantity", 0] } }
+                                            ]
+                                        }
+                                    }
+                                },
+                                {
+                                    $group: {
+                                        _id: null,
+                                        productsCount: { $sum: 1 },
+                                        totalStock: { $sum: "$stock" }
+                                    }
+                                }
+                            ],
+                            as: "stats"
+                        }
+                    },
+                    {
+                        $addFields: {
+                            statsDoc: { $arrayElemAt: ["$stats", 0] }
+                        }
+                    },
+                    {
+                        $addFields: {
+                            productsCount: { $ifNull: ["$statsDoc.productsCount", 0] },
+                            totalProducts: { $ifNull: ["$statsDoc.productsCount", 0] },
+                            totalStock: { $ifNull: ["$statsDoc.totalStock", 0] }
+                        }
+                    },
+                    {
+                        $project: {
+                            stats: 0,
+                            statsDoc: 0
+                        }
+                    },
+                    {
+                        $sort: { createdAt: -1, _id: -1 }
+                    }
+                ];
+
+                const result = await categoryCollection.aggregate(pipeline).toArray();
                 res.send(result);
             } catch (err) {
                 console.error("Error fetching categories:", err);
