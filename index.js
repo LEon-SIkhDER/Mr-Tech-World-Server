@@ -39,6 +39,10 @@ async function connectToMongoDB() {
 
         // Category & Product indexes for fast relational lookup and sort
         productCollection.createIndex({ category: 1 }).catch(() => { });
+        productCollection.createIndex({ createdAt: -1 }).catch(() => { });
+        productCollection.createIndex({ name: 1 }).catch(() => { });
+        productCollection.createIndex({ brand: 1 }).catch(() => { });
+        productCollection.createIndex({ "variants.barcode": 1 }).catch(() => { });
         categoryCollection.createIndex({ createdAt: -1 }).catch(() => { });
 
         // Supplier & Purchase indexes for fast relational lookup, purchase linking, and sort
@@ -708,10 +712,102 @@ async function connectToMongoDB() {
         // * ------------------------------------ PRODUCT APIs (products) ---------------------------------------
         // ====================================================================================================
 
-        // GET /products -> List of products with live variant stock, price ranges, and category name
+        // GET /products -> High performance, paginated product catalog with search, filter, and sorting
         app.get("/products", async (req, res) => {
             try {
+                const {
+                    search,
+                    category,
+                    stockStatus = "all",
+                    page,
+                    limit,
+                    sortBy = "createdAt",
+                    sortOrder = "desc",
+                    paginate
+                } = req.query;
+
+                const pageNum = Math.max(1, parseInt(page, 10) || 1);
+                const limitNum = Math.max(1, Math.min(100, parseInt(limit, 10) || 10));
+                const skipNum = (pageNum - 1) * limitNum;
+
+                // 1. Match Stage (Search & Category)
+                const andConditions = [];
+
+                if (search && search.trim()) {
+                    const cleanSearch = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                    const searchRegex = new RegExp(cleanSearch, 'i');
+                    andConditions.push({
+                        $or: [
+                            { name: searchRegex },
+                            { brand: searchRegex },
+                            { model: searchRegex },
+                            { "variants.barcode": searchRegex }
+                        ]
+                    });
+                }
+
+                if (category && category !== 'all' && category.trim()) {
+                    const trimmedCat = category.trim();
+                    if (ObjectId.isValid(trimmedCat)) {
+                        andConditions.push({
+                            $or: [
+                                { category: trimmedCat },
+                                { category: new ObjectId(trimmedCat) }
+                            ]
+                        });
+                    } else {
+                        andConditions.push({ category: trimmedCat });
+                    }
+                }
+
+                const matchStage = andConditions.length > 0 ? { $and: andConditions } : {};
+
+                // 2. Sorting Stage
+                const sortDirection = sortOrder === "asc" ? 1 : -1;
+                let sortStage = { createdAt: -1 };
+                if (sortBy === "name") {
+                    sortStage = { name: sortDirection };
+                } else if (sortBy === "stock" || sortBy === "totalStock") {
+                    sortStage = { totalStock: sortDirection };
+                } else {
+                    sortStage = { [sortBy]: sortDirection };
+                }
+
+                // 3. Optimized Aggregation Pipeline
                 const pipeline = [
+                    { $match: matchStage },
+                    {
+                        $addFields: {
+                            variants: { $ifNull: ["$variants", []] },
+                            totalStock: {
+                                $reduce: {
+                                    input: { $ifNull: ["$variants", []] },
+                                    initialValue: 0,
+                                    in: { $add: ["$$value", { $toDouble: { $ifNull: ["$$this.quantity", 0] } }] }
+                                }
+                            }
+                        }
+                    }
+                ];
+
+                // Filter by stock status if provided
+                if (stockStatus && stockStatus !== 'all') {
+                    if (stockStatus === 'inStock') {
+                        pipeline.push({ $match: { totalStock: { $gt: 0 } } });
+                    } else if (stockStatus === 'lowStock') {
+                        pipeline.push({ $match: { totalStock: { $gt: 0, $lte: 10 } } });
+                    } else if (stockStatus === 'outOfStock') {
+                        pipeline.push({ $match: { totalStock: { $lte: 0 } } });
+                    }
+                }
+
+                pipeline.push({ $sort: sortStage });
+
+                // Check if consumer specifically requested an unpaginated flat array
+                const isExplicitlyUnpaginated = paginate === 'false' || req.query.all === 'true';
+
+                // Project and compute rich product details
+                const projectProductDetailsStages = [
                     {
                         $lookup: {
                             from: "categories",
@@ -737,19 +833,21 @@ async function connectToMongoDB() {
                             categoryName: {
                                 $ifNull: [{ $arrayElemAt: ["$categoryDoc.name", 0] }, "Uncategorized"]
                             },
-                            variants: { $ifNull: ["$variants", []] },
-                            totalStock: {
-                                $reduce: {
-                                    input: { $ifNull: ["$variants", []] },
-                                    initialValue: 0,
-                                    in: { $add: ["$$value", { $toDouble: { $ifNull: ["$$this.quantity", 0] } }] }
+                            variantsCount: { $size: "$variants" },
+                            validRetailPrices: {
+                                $filter: {
+                                    input: "$variants.retailPrice",
+                                    as: "p",
+                                    cond: { $gt: ["$$p", 0] }
                                 }
                             },
-                            variantsCount: { $size: { $ifNull: ["$variants", []] } },
-                            minRetailPrice: { $min: "$variants.retailPrice" },
-                            maxRetailPrice: { $max: "$variants.retailPrice" },
-                            minMrp: { $min: "$variants.mrp" },
-                            maxMrp: { $max: "$variants.mrp" },
+                            validMrps: {
+                                $filter: {
+                                    input: "$variants.mrp",
+                                    as: "m",
+                                    cond: { $gt: ["$$m", 0] }
+                                }
+                            },
                             image: {
                                 $let: {
                                     vars: {
@@ -775,17 +873,41 @@ async function connectToMongoDB() {
                                         ]
                                     }
                                 }
+                            },
+                            // Exclude batches & imeis for security and light-speed payload
+                            variants: {
+                                $map: {
+                                    input: "$variants",
+                                    as: "v",
+                                    in: {
+                                        title: "$$v.title",
+                                        barcode: { $ifNull: ["$$v.barcode", ""] },
+                                        quantity: { $ifNull: ["$$v.quantity", 0] },
+                                        retailPrice: { $ifNull: ["$$v.retailPrice", 0] },
+                                        mrp: { $ifNull: ["$$v.mrp", 0] },
+                                        combination: { $ifNull: ["$$v.combination", []] },
+                                        attributes: { $ifNull: ["$$v.attributes", []] }
+                                    }
+                                }
                             }
                         }
                     },
                     {
                         $addFields: {
+                            minRetailPrice: { $ifNull: [{ $min: "$validRetailPrices" }, 0] },
+                            maxRetailPrice: { $ifNull: [{ $max: "$validRetailPrices" }, 0] },
+                            minMrp: { $ifNull: [{ $min: "$validMrps" }, 0] },
+                            maxMrp: { $ifNull: [{ $max: "$validMrps" }, 0] }
+                        }
+                    },
+                    {
+                        $addFields: {
                             retailPriceRange: {
-                                min: { $ifNull: ["$minRetailPrice", 0] },
-                                max: { $ifNull: ["$maxRetailPrice", 0] },
+                                min: "$minRetailPrice",
+                                max: "$maxRetailPrice",
                                 formatted: {
                                     $cond: [
-                                        { $gt: [{ $ifNull: ["$maxRetailPrice", 0] }, 0] },
+                                        { $gt: ["$maxRetailPrice", 0] },
                                         {
                                             $cond: [
                                                 { $eq: ["$minRetailPrice", "$maxRetailPrice"] },
@@ -798,11 +920,11 @@ async function connectToMongoDB() {
                                 }
                             },
                             mrpRange: {
-                                min: { $ifNull: ["$minMrp", 0] },
-                                max: { $ifNull: ["$maxMrp", 0] },
+                                min: "$minMrp",
+                                max: "$maxMrp",
                                 formatted: {
                                     $cond: [
-                                        { $gt: [{ $ifNull: ["$maxMrp", 0] }, 0] },
+                                        { $gt: ["$maxMrp", 0] },
                                         {
                                             $cond: [
                                                 { $eq: ["$minMrp", "$maxMrp"] },
@@ -818,13 +940,43 @@ async function connectToMongoDB() {
                     },
                     {
                         $project: {
-                            categoryDoc: 0
+                            categoryDoc: 0,
+                            validRetailPrices: 0,
+                            validMrps: 0
                         }
                     }
                 ];
 
-                const result = await productCollection.aggregate(pipeline).toArray();
-                res.send(result);
+                if (isExplicitlyUnpaginated) {
+                    const unpaginatedPipeline = [...pipeline, ...projectProductDetailsStages];
+                    const products = await productCollection.aggregate(unpaginatedPipeline).toArray();
+                    return res.send(products);
+                }
+
+                // High-performance facet pagination: lookup only on the paginated slice
+                pipeline.push({
+                    $facet: {
+                        metadata: [{ $count: "total" }],
+                        products: [
+                            { $skip: skipNum },
+                            { $limit: limitNum },
+                            ...projectProductDetailsStages
+                        ]
+                    }
+                });
+
+                const [facetResult] = await productCollection.aggregate(pipeline).toArray();
+                const totalProductCounts = facetResult?.metadata?.[0]?.total || 0;
+                const products = facetResult?.products || [];
+                const totalPages = Math.ceil(totalProductCounts / limitNum) || 1;
+
+                res.send({
+                    products,
+                    totalProductCounts,
+                    totalPages,
+                    currentPage: pageNum,
+                    limit: limitNum
+                });
             } catch (err) {
                 console.error("Error fetching products:", err);
                 res.status(500).send({ message: "Failed to fetch products" });
