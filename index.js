@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const { MongoClient, ObjectId } = require('mongodb');
 const crypto = require('crypto');
 const cors = require('cors');
@@ -1204,24 +1204,526 @@ async function connectToMongoDB() {
         //     res.redirect(307, `/product/scan/barcode/${encodeURIComponent(req.params.barcode)}${queryParams}`);
         // });
 
-        // GET /product/:id -> Retrieve complete single product details by product ObjectId
+        // GET /product/:id -> High-performance aggregated product details with category, enriched batches, IMEIs, and valuation metrics
+
+
+        // Primary route: GET /product/:id
         app.get("/product/:id", async (req, res) => {
             try {
                 const { id } = req.params;
                 if (!ObjectId.isValid(id)) {
                     return res.status(400).send({ message: "Invalid product ID format" });
                 }
-                const query = { _id: new ObjectId(id) };
-                const result = await productCollection.findOne(query);
+                const objectId = new ObjectId(id);
+
+                const pipeline = [
+                    // 1. Target single product by primary key index (_id)
+                    { $match: { _id: objectId } },
+
+                    // 2. Lookup Category details (handling ObjectId, string ID, or name)
+                    {
+                        $lookup: {
+                            from: "categories",
+                            let: { catId: "$category" },
+                            pipeline: [
+                                {
+                                    $match: {
+                                        $expr: {
+                                            $or: [
+                                                { $eq: ["$_id", "$$catId"] },
+                                                { $eq: [{ $toString: "$_id" }, { $toString: "$$catId" }] },
+                                                { $eq: ["$name", "$$catId"] }
+                                            ]
+                                        }
+                                    }
+                                }
+                            ],
+                            as: "categoryDoc"
+                        }
+                    },
+
+                    // 3. Extract all unique supplier IDs from all variant batches for batch-supplier lookup
+                    {
+                        $lookup: {
+                            from: "suppliers",
+                            let: {
+                                supplierIds: {
+                                    $reduce: {
+                                        input: { $ifNull: ["$variants", []] },
+                                        initialValue: [],
+                                        in: {
+                                            $concatArrays: [
+                                                "$$value",
+                                                {
+                                                    $map: {
+                                                        input: { $ifNull: ["$$this.batches", []] },
+                                                        as: "b",
+                                                        in: "$$b.supplierId"
+                                                    }
+                                                }
+                                            ]
+                                        }
+                                    }
+                                }
+                            },
+                            pipeline: [
+                                {
+                                    $match: {
+                                        $expr: {
+                                            $or: [
+                                                { $in: ["$_id", "$$supplierIds"] },
+                                                {
+                                                    $in: [
+                                                        { $toString: "$_id" },
+                                                        {
+                                                            $map: {
+                                                                input: {
+                                                                    $filter: {
+                                                                        input: "$$supplierIds",
+                                                                        as: "s",
+                                                                        cond: { $ne: ["$$s", null] }
+                                                                    }
+                                                                },
+                                                                as: "sid",
+                                                                in: { $toString: "$$sid" }
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    }
+                                },
+                                {
+                                    $project: {
+                                        _id: 1,
+                                        name: 1,
+                                        phone: 1,
+                                        email: 1,
+                                        contactPerson: 1
+                                    }
+                                }
+                            ],
+                            as: "suppliersDoc"
+                        }
+                    },
+
+                    // 4. Transform and enrich variants, batches, and IMEIs
+                    {
+                        $addFields: {
+                            categoryDetails: { $ifNull: [{ $arrayElemAt: ["$categoryDoc", 0] }, null] },
+                            categoryName: {
+                                $ifNull: [{ $arrayElemAt: ["$categoryDoc.name", 0] }, "Uncategorized"]
+                            },
+                            variants: {
+                                $map: {
+                                    input: { $ifNull: ["$variants", []] },
+                                    as: "v",
+                                    in: {
+                                        $let: {
+                                            vars: {
+                                                enrichedBatches: {
+                                                    $map: {
+                                                        input: { $ifNull: ["$$v.batches", []] },
+                                                        as: "b",
+                                                        in: {
+                                                            $let: {
+                                                                vars: {
+                                                                    matchedSup: {
+                                                                        $arrayElemAt: [
+                                                                            {
+                                                                                $filter: {
+                                                                                    input: "$suppliersDoc",
+                                                                                    as: "sup",
+                                                                                    cond: {
+                                                                                        $or: [
+                                                                                            { $eq: ["$$sup._id", "$$b.supplierId"] },
+                                                                                            {
+                                                                                                $and: [
+                                                                                                    { $ne: ["$$b.supplierId", null] },
+                                                                                                    { $eq: [{ $toString: "$$sup._id" }, { $toString: "$$b.supplierId" }] }
+                                                                                                ]
+                                                                                            }
+                                                                                        ]
+                                                                                    }
+                                                                                }
+                                                                            },
+                                                                            0
+                                                                        ]
+                                                                    },
+                                                                    remQty: { $toDouble: { $ifNull: ["$$b.remainingQuantity", 0] } },
+                                                                    unitCost: { $toDouble: { $ifNull: ["$$b.purchasePrice", 0] } }
+                                                                },
+                                                                in: {
+                                                                    batchId: { $ifNull: ["$$b.batchId", ""] },
+                                                                    invoiceNo: { $ifNull: ["$$b.invoiceNo", ""] },
+                                                                    supplierId: { $ifNull: ["$$b.supplierId", null] },
+                                                                    supplierName: { $ifNull: ["$$matchedSup.name", "Default / Initial Supplier"] },
+                                                                    supplierPhone: { $ifNull: ["$$matchedSup.phone", ""] },
+                                                                    supplierEmail: { $ifNull: ["$$matchedSup.email", ""] },
+                                                                    supplierContactPerson: { $ifNull: ["$$matchedSup.contactPerson", ""] },
+                                                                    purchasePrice: "$$unitCost",
+                                                                    receivedQuantity: { $toDouble: { $ifNull: ["$$b.receivedQuantity", 0] } },
+                                                                    remainingQuantity: "$$remQty",
+                                                                    totalCostValue: { $multiply: ["$$remQty", "$$unitCost"] },
+                                                                    purchaseDate: { $ifNull: ["$$b.purchaseDate", "$$b.createdAt"] },
+                                                                    createdAt: { $ifNull: ["$$b.createdAt", null] },
+                                                                    imeis: { $ifNull: ["$$b.imeis", []] }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                },
+                                                varQty: { $toDouble: { $ifNull: ["$$v.quantity", 0] } },
+                                                retPrice: { $toDouble: { $ifNull: ["$$v.retailPrice", 0] } },
+                                                mrpPrice: { $toDouble: { $ifNull: ["$$v.mrp", 0] } }
+                                            },
+                                            in: {
+                                                $let: {
+                                                    vars: {
+                                                        varCostValue: {
+                                                            $reduce: {
+                                                                input: "$$enrichedBatches",
+                                                                initialValue: 0,
+                                                                in: { $add: ["$$value", { $ifNull: ["$$this.totalCostValue", 0] }] }
+                                                            }
+                                                        }
+                                                    },
+                                                    in: {
+                                                        title: { $ifNull: ["$$v.title", "Standard"] },
+                                                        combination: { $ifNull: ["$$v.combination", []] },
+                                                        attributes: { $ifNull: ["$$v.attributes", []] },
+                                                        barcode: { $ifNull: ["$$v.barcode", ""] },
+                                                        quantity: "$$varQty",
+                                                        retailPrice: "$$retPrice",
+                                                        mrp: "$$mrpPrice",
+                                                        batches: "$$enrichedBatches",
+                                                        imeis: { $ifNull: ["$$v.imeis", []] },
+                                                        inventoryCostValue: "$$varCostValue",
+                                                        projectedRevenue: { $multiply: ["$$varQty", "$$retPrice"] },
+                                                        avgCostPrice: {
+                                                            $cond: [
+                                                                { $gt: ["$$varQty", 0] },
+                                                                { $round: [{ $divide: ["$$varCostValue", "$$varQty"] }, 2] },
+                                                                {
+                                                                    $cond: [
+                                                                        { $gt: [{ $size: "$$enrichedBatches" }, 0] },
+                                                                        { $arrayElemAt: ["$$enrichedBatches.purchasePrice", 0] },
+                                                                        0
+                                                                    ]
+                                                                }
+                                                            ]
+                                                        },
+                                                        marginAmount: {
+                                                            $cond: [
+                                                                { $gt: ["$$varQty", 0] },
+                                                                { $round: [{ $subtract: ["$$retPrice", { $divide: ["$$varCostValue", "$$varQty"] }] }, 2] },
+                                                                0
+                                                            ]
+                                                        },
+                                                        marginPercentage: {
+                                                            $cond: [
+                                                                { $and: [{ $gt: ["$$varQty", 0] }, { $gt: ["$$retPrice", 0] }] },
+                                                                {
+                                                                    $round: [
+                                                                        {
+                                                                            $multiply: [
+                                                                                {
+                                                                                    $divide: [
+                                                                                        { $subtract: ["$$retPrice", { $divide: ["$$varCostValue", "$$varQty"] }] },
+                                                                                        "$$retPrice"
+                                                                                    ]
+                                                                                },
+                                                                                100
+                                                                            ]
+                                                                        },
+                                                                        2
+                                                                    ]
+                                                                },
+                                                                0
+                                                            ]
+                                                        },
+                                                        createdAt: "$$v.createdAt",
+                                                        updatedAt: "$$v.updatedAt"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+
+                    // 5. Compute global inventory, prices, cost basis, and metrics across all variants
+                    {
+                        $addFields: {
+                            totalStock: {
+                                $reduce: {
+                                    input: "$variants",
+                                    initialValue: 0,
+                                    in: { $add: ["$$value", { $ifNull: ["$$this.quantity", 0] }] }
+                                }
+                            },
+                            variantsCount: { $size: "$variants" },
+                            totalInventoryCost: {
+                                $reduce: {
+                                    input: "$variants",
+                                    initialValue: 0,
+                                    in: { $add: ["$$value", { $ifNull: ["$$this.inventoryCostValue", 0] }] }
+                                }
+                            },
+                            totalProjectedRevenue: {
+                                $reduce: {
+                                    input: "$variants",
+                                    initialValue: 0,
+                                    in: { $add: ["$$value", { $ifNull: ["$$this.projectedRevenue", 0] }] }
+                                }
+                            },
+                            validRetailPrices: {
+                                $filter: {
+                                    input: "$variants.retailPrice",
+                                    as: "p",
+                                    cond: { $gt: ["$$p", 0] }
+                                }
+                            },
+                            validMrps: {
+                                $filter: {
+                                    input: "$variants.mrp",
+                                    as: "m",
+                                    cond: { $gt: ["$$m", 0] }
+                                }
+                            },
+                            validPurchasePrices: {
+                                $reduce: {
+                                    input: "$variants",
+                                    initialValue: [],
+                                    in: {
+                                        $concatArrays: [
+                                            "$$value",
+                                            {
+                                                $filter: {
+                                                    input: {
+                                                        $map: {
+                                                            input: { $ifNull: ["$$this.batches", []] },
+                                                            as: "b",
+                                                            in: "$$b.purchasePrice"
+                                                        }
+                                                    },
+                                                    as: "cost",
+                                                    cond: { $gt: ["$$cost", 0] }
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            },
+                            // Flatten all batches across variants for immediate table rendering
+                            allBatches: {
+                                $reduce: {
+                                    input: "$variants",
+                                    initialValue: [],
+                                    in: {
+                                        $concatArrays: [
+                                            "$$value",
+                                            {
+                                                $map: {
+                                                    input: { $ifNull: ["$$this.batches", []] },
+                                                    as: "batch",
+                                                    in: {
+                                                        batchId: "$$batch.batchId",
+                                                        invoiceNo: "$$batch.invoiceNo",
+                                                        variantTitle: "$$this.title",
+                                                        variantBarcode: "$$this.barcode",
+                                                        supplierId: "$$batch.supplierId",
+                                                        supplierName: "$$batch.supplierName",
+                                                        supplierPhone: "$$batch.supplierPhone",
+                                                        supplierEmail: "$$batch.supplierEmail",
+                                                        purchasePrice: "$$batch.purchasePrice",
+                                                        receivedQuantity: "$$batch.receivedQuantity",
+                                                        remainingQuantity: "$$batch.remainingQuantity",
+                                                        totalCostValue: "$$batch.totalCostValue",
+                                                        purchaseDate: "$$batch.purchaseDate",
+                                                        imeis: "$$batch.imeis"
+                                                    }
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            },
+                            // Flatten all active remaining IMEIs across variants for instant barcode scanner/inventory search
+                            allImeis: {
+                                $reduce: {
+                                    input: "$variants",
+                                    initialValue: [],
+                                    in: {
+                                        $concatArrays: [
+                                            "$$value",
+                                            {
+                                                $map: {
+                                                    input: { $ifNull: ["$$this.imeis", []] },
+                                                    as: "im",
+                                                    in: {
+                                                        imei1: {
+                                                            $cond: [
+                                                                { $eq: [{ $type: "$$im" }, "string"] },
+                                                                "$$im",
+                                                                { $ifNull: ["$$im.imei1", "$$im.imei"] }
+                                                            ]
+                                                        },
+                                                        imei2: {
+                                                            $cond: [
+                                                                { $eq: [{ $type: "$$im" }, "string"] },
+                                                                "",
+                                                                { $ifNull: ["$$im.imei2", ""] }
+                                                            ]
+                                                        },
+                                                        variantTitle: "$$this.title",
+                                                        variantBarcode: "$$this.barcode",
+                                                        status: "available"
+                                                    }
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    },
+
+                    // 6. Compute price ranges, gross profit, margin, and stock status
+                    {
+                        $addFields: {
+                            minRetailPrice: { $ifNull: [{ $min: "$validRetailPrices" }, 0] },
+                            maxRetailPrice: { $ifNull: [{ $max: "$validRetailPrices" }, 0] },
+                            minMrp: { $ifNull: [{ $min: "$validMrps" }, 0] },
+                            maxMrp: { $ifNull: [{ $max: "$validMrps" }, 0] },
+                            minPurchasePrice: { $ifNull: [{ $min: "$validPurchasePrices" }, 0] },
+                            maxPurchasePrice: { $ifNull: [{ $max: "$validPurchasePrices" }, 0] },
+                            batchesCount: { $size: "$allBatches" },
+                            activeImeisCount: { $size: "$allImeis" },
+                            projectedGrossProfit: { $subtract: ["$totalProjectedRevenue", "$totalInventoryCost"] }
+                        }
+                    },
+
+                    // 7. Add human-friendly formatted ranges, sorted batches, and stock status
+                    {
+                        $addFields: {
+                            retailPriceRange: {
+                                min: "$minRetailPrice",
+                                max: "$maxRetailPrice",
+                                formatted: {
+                                    $cond: [
+                                        { $gt: ["$maxRetailPrice", 0] },
+                                        {
+                                            $cond: [
+                                                { $eq: ["$minRetailPrice", "$maxRetailPrice"] },
+                                                { $concat: ["৳", { $toString: "$minRetailPrice" }] },
+                                                { $concat: ["৳", { $toString: "$minRetailPrice" }, " - ৳", { $toString: "$maxRetailPrice" }] }
+                                            ]
+                                        },
+                                        "N/A"
+                                    ]
+                                }
+                            },
+                            mrpRange: {
+                                min: "$minMrp",
+                                max: "$maxMrp",
+                                formatted: {
+                                    $cond: [
+                                        { $gt: ["$maxMrp", 0] },
+                                        {
+                                            $cond: [
+                                                { $eq: ["$minMrp", "$maxMrp"] },
+                                                { $concat: ["৳", { $toString: "$minMrp" }] },
+                                                { $concat: ["৳", { $toString: "$minMrp" }, " - ৳", { $toString: "$maxMrp" }] }
+                                            ]
+                                        },
+                                        "N/A"
+                                    ]
+                                }
+                            },
+                            purchasePriceRange: {
+                                min: "$minPurchasePrice",
+                                max: "$maxPurchasePrice",
+                                formatted: {
+                                    $cond: [
+                                        { $gt: ["$maxPurchasePrice", 0] },
+                                        {
+                                            $cond: [
+                                                { $eq: ["$minPurchasePrice", "$maxPurchasePrice"] },
+                                                { $concat: ["৳", { $toString: "$minPurchasePrice" }] },
+                                                { $concat: ["৳", { $toString: "$minPurchasePrice" }, " - ৳", { $toString: "$maxPurchasePrice" }] }
+                                            ]
+                                        },
+                                        "N/A"
+                                    ]
+                                }
+                            },
+                            grossProfitMargin: {
+                                $cond: [
+                                    { $gt: ["$totalProjectedRevenue", 0] },
+                                    {
+                                        $round: [
+                                            {
+                                                $multiply: [
+                                                    { $divide: ["$projectedGrossProfit", "$totalProjectedRevenue"] },
+                                                    100
+                                                ]
+                                            },
+                                            2
+                                        ]
+                                    },
+                                    0
+                                ]
+                            },
+                            stockStatus: {
+                                $cond: [
+                                    { $gt: ["$totalStock", 10] },
+                                    "inStock",
+                                    {
+                                        $cond: [
+                                            { $gt: ["$totalStock", 0] },
+                                            "lowStock",
+                                            "outOfStock"
+                                        ]
+                                    }
+                                ]
+                            },
+                            allBatches: {
+                                $sortArray: {
+                                    input: "$allBatches",
+                                    sortBy: { purchaseDate: -1 }
+                                }
+                            }
+                        }
+                    },
+
+                    // 8. Clean up intermediate lookup arrays and temporary price arrays
+                    {
+                        $project: {
+                            categoryDoc: 0,
+                            suppliersDoc: 0,
+                            validRetailPrices: 0,
+                            validMrps: 0,
+                            validPurchasePrices: 0
+                        }
+                    }
+                ];
+
+                const [result] = await productCollection.aggregate(pipeline).toArray();
                 if (!result) {
                     return res.status(404).send({ message: "Product not found" });
                 }
                 res.send(result);
             } catch (err) {
-                console.error("Error fetching product by ID:", err);
-                res.status(500).send({ message: "Failed to fetch product" });
+                console.error("Error fetching aggregated product details by ID:", err);
+                res.status(500).send({ message: "Failed to fetch product details" });
             }
         });
+
+
 
         // GET /product/:id/combinations -> Retrieve variant combinations, attributes, and IMEI configurations by product ID
         app.get("/product/:id/combinations", async (req, res) => {
@@ -1277,6 +1779,13 @@ async function connectToMongoDB() {
                 res.status(500).send({ message: "Failed to create product" });
             }
         });
+
+        app.delete("/product/:id", async (req, res) => {
+            const { id } = req.params
+            const query = { _id: new ObjectId(id) }
+            const result = await productCollection.deleteOne(query)
+            res.send(result)
+        })
 
         // ====================================================================================================
         // * ------------------------------------ PURCHASE APIs (purchases) -------------------------------------
