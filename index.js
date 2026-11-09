@@ -3,7 +3,7 @@ const { MongoClient, ObjectId } = require('mongodb');
 const crypto = require('crypto');
 const cors = require('cors');
 const app = express();
-const port = 5000;
+const port = process.env.PORT || 5000;
 const dns = require("node:dns");
 dns.setServers(["8.8.8.8", "8.8.4.4"]);
 const path = require('path');
@@ -38,6 +38,8 @@ async function connectToMongoDB() {
         salesCollection.createIndex({ totalPayable: 1 }).catch(() => { });
 
         // Category & Product indexes for fast relational lookup and sort
+        productCollection.createIndex({ status: 1 }).catch(() => { });
+        productCollection.createIndex({ status: 1, category: 1 }).catch(() => { });
         productCollection.createIndex({ category: 1 }).catch(() => { });
         productCollection.createIndex({ createdAt: -1 }).catch(() => { });
         productCollection.createIndex({ name: 1 }).catch(() => { });
@@ -348,11 +350,22 @@ async function connectToMongoDB() {
                     const fetchedProducts = await productCollection
                         .find(
                             { _id: { $in: uniqueProductIds } },
-                            { projection: { variants: 1, hasImei: 1 } }
+                            { projection: { variants: 1, hasImei: 1, status: 1, name: 1 } }
                         )
                         .toArray();
 
                     const productMap = new Map(fetchedProducts.map((p) => [p._id.toString(), p]));
+
+                    // Validate that no product in the sale is inactive
+                    for (const item of saleData.items) {
+                        if (!item.productId) continue;
+                        const prod = productMap.get(item.productId.toString());
+                        if (prod && prod.status && prod.status !== "active") {
+                            return res.status(400).send({
+                                message: `Cannot complete sale: "${prod.name || 'Product'}" is inactive.`
+                            });
+                        }
+                    }
 
                     // Process item deductions in-memory
                     for (const soldItem of saleData.items) {
@@ -666,40 +679,53 @@ async function connectToMongoDB() {
         });
 
         // DELETE /category/:id -> Delete a category only if no products are assigned to it
+        // DELETE /category/:id -> Single round-trip pre-check
         app.delete("/category/:id", async (req, res) => {
             try {
                 const { id } = req.params;
-
                 if (!ObjectId.isValid(id)) {
                     return res.status(400).send({ message: "Invalid category ID format" });
                 }
 
-                // 1. Verify category exists
-                const category = await categoryCollection.findOne({ _id: new ObjectId(id) });
-                if (!category) {
+                // 1. Single round-trip: Verifies existence AND counts linked products
+                const [check] = await categoryCollection.aggregate([
+                    { $match: { _id: new ObjectId(id) } },
+                    {
+                        $lookup: {
+                            from: "products",
+                            let: { catId: "$_id", catStr: { $toString: "$_id" }, catName: "$name" },
+                            pipeline: [
+                                {
+                                    $match: {
+                                        $expr: {
+                                            $or: [
+                                                { $eq: ["$category", "$$catId"] },
+                                                { $eq: ["$category", "$$catStr"] },
+                                                { $eq: ["$category", "$$catName"] }
+                                            ]
+                                        }
+                                    }
+                                },
+                                { $count: "count" }
+                            ],
+                            as: "productCheck"
+                        }
+                    }
+                ]).toArray();
+
+                // Category not found
+                if (!check) {
                     return res.status(404).send({ message: "Category not found" });
                 }
 
-                // 2. Check if any products reference this category (by String ID, ObjectId, or name)
-                const categoryMatch = [
-                    { category: id },
-                    { category: new ObjectId(id) }
-                ];
-                if (category.name) {
-                    categoryMatch.push({ category: category.name });
-                }
-
-                const assignedProductsCount = await productCollection.countDocuments({
-                    $or: categoryMatch
-                });
-
-                if (assignedProductsCount > 0) {
+                const assignedCount = check.productCheck[0]?.count || 0;
+                if (assignedCount > 0) {
                     return res.status(400).send({
-                        message: `Cannot delete category: ${assignedProductsCount} product(s) are assigned to this category. Please reassign or delete them first.`
+                        message: `Cannot delete category: ${assignedCount} product(s) are assigned to this category. Please reassign or delete them first.`
                     });
                 }
 
-                // 3. Delete the category once confirmed safe
+                // 2. Safe to delete (only 1 additional call)
                 const result = await categoryCollection.deleteOne({ _id: new ObjectId(id) });
                 res.send(result);
             } catch (err) {
@@ -719,6 +745,7 @@ async function connectToMongoDB() {
                     search,
                     category,
                     stockStatus = "all",
+                    status = "all",
                     page,
                     limit,
                     sortBy = "createdAt",
@@ -758,6 +785,10 @@ async function connectToMongoDB() {
                     } else {
                         andConditions.push({ category: trimmedCat });
                     }
+                }
+
+                if (status && status !== 'all' && status.trim()) {
+                    andConditions.push({ status: status.trim() });
                 }
 
                 const matchStage = andConditions.length > 0 ? { $and: andConditions } : {};
@@ -1015,7 +1046,7 @@ async function connectToMongoDB() {
         app.get("/products/pos", async (req, res) => {
             try {
                 const { search, category, limit, skip } = req.query;
-                let query = {};
+                let query = { status: "active" };
                 if (search) {
                     query.name = { $regex: search, $options: 'i' };
                 }
@@ -1063,8 +1094,13 @@ async function connectToMongoDB() {
         // GET /products-name-id -> Retrieve product names and IDs only for search comboboxes and selection inputs
         app.get("/products-name-id", async (req, res) => {
             try {
-                const projection = { projection: { name: 1, productType: 1 } };
-                const result = await productCollection.find({}, projection).toArray();
+                const { status } = req.query;
+                const query = {};
+                if (status && status !== "all") {
+                    query.status = status;
+                }
+                const projection = { projection: { name: 1, productType: 1, status: 1 } };
+                const result = await productCollection.find(query, projection).toArray();
                 res.send(result);
             } catch (err) {
                 console.error("Error fetching products name and ID:", err);
@@ -1108,6 +1144,7 @@ async function connectToMongoDB() {
                         retailPrice: 1,
                         mrp: 1,
                         quantity: 1,
+                        status: 1,
                         variants: {
                             $elemMatch: {
                                 $or: [
@@ -1124,6 +1161,10 @@ async function connectToMongoDB() {
                 const product = await productCollection.findOne(query, projection);
                 if (!product) {
                     return res.status(404).send({ message: "Product not found" });
+                }
+
+                if (product.status && product.status !== "active") {
+                    return res.status(400).send({ message: `"${product.name || 'Product'}" is inactive and cannot be sold` });
                 }
 
                 const variant = Array.isArray(product.variants) && product.variants.length > 0
@@ -1766,10 +1807,13 @@ async function connectToMongoDB() {
             res.redirect(307, `/product/${req.params.id}/combinations`);
         });
 
-        // POST /product -> Insert a new product into the catalog with server timestamps
+        // POST /product -> Insert a new product into the catalog with server timestamps & default active status
         app.post("/product", async (req, res) => {
             try {
                 const data = req.body;
+                if (!data.status || typeof data.status !== 'string') {
+                    data.status = "active";
+                }
                 data.createdAt = new Date();
                 data.updatedAt = new Date();
                 const result = await productCollection.insertOne(data);
@@ -1780,12 +1824,72 @@ async function connectToMongoDB() {
             }
         });
 
+        // PATCH /product/:id/status -> Update or toggle product active/inactive status
+        app.patch("/product/:id/status", async (req, res) => {
+            try {
+                const { id } = req.params;
+                const { status } = req.body;
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).send({ message: "Invalid product ID format" });
+                }
+                if (!status || typeof status !== "string") {
+                    return res.status(400).send({ message: "Valid status string is required" });
+                }
+                const normalizedStatus = status.trim().toLowerCase();
+                const result = await productCollection.updateOne(
+                    { _id: new ObjectId(id) },
+                    { $set: { status: normalizedStatus, updatedAt: new Date() } }
+                );
+                if (result.matchedCount === 0) {
+                    return res.status(404).send({ message: "Product not found" });
+                }
+                res.send({ success: true, matchedCount: result.matchedCount, modifiedCount: result.modifiedCount, status: normalizedStatus });
+            } catch (err) {
+                console.error("Error updating product status:", err);
+                res.status(500).send({ message: "Failed to update product status" });
+            }
+        });
+
         app.delete("/product/:id", async (req, res) => {
-            const { id } = req.params
-            const query = { _id: new ObjectId(id) }
-            const result = await productCollection.deleteOne(query)
-            res.send(result)
-        })
+            try {
+                const { id } = req.params;
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).send({ message: "Invalid product ID format" });
+                }
+
+                const productObjectId = new ObjectId(id);
+
+                // 1. Check if product exists in any purchase
+                const hasPurchases = await purchaseCollection.findOne({
+                    $or: [
+                        { productId: id },
+                        { productId: productObjectId },
+                        { "items.productId": id },
+                        { "items.productId": productObjectId }
+                    ]
+                });
+
+                // 2. Check if product exists in any sale
+                const hasSales = await salesCollection.findOne({
+                    $or: [
+                        { "items.productId": id },
+                        { "items.productId": productObjectId }
+                    ]
+                });
+
+                if (hasPurchases || hasSales) {
+                    return res.status(400).send({
+                        message: "Cannot delete this product because it has purchase or sales history. Deactivate or archive it instead."
+                    });
+                }
+
+                // 3. Safe to delete only if no transaction history exists
+                const result = await productCollection.deleteOne({ _id: productObjectId });
+                res.send(result);
+            } catch (error) {
+                res.status(500).send({ message: "Failed to delete product", error: error.message });
+            }
+        });
 
         // ====================================================================================================
         // * ------------------------------------ PURCHASE APIs (purchases) -------------------------------------
