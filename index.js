@@ -36,6 +36,7 @@ async function connectToMongoDB() {
         salesCollection.createIndex({ paymentStatus: 1 }).catch(() => { });
         salesCollection.createIndex({ paymentMethod: 1 }).catch(() => { });
         salesCollection.createIndex({ totalPayable: 1 }).catch(() => { });
+        salesCollection.createIndex({ priceType: 1 }).catch(() => { });
 
         // Category & Product indexes for fast relational lookup and sort
         productCollection.createIndex({ status: 1 }).catch(() => { });
@@ -50,6 +51,14 @@ async function connectToMongoDB() {
         // Supplier & Purchase indexes for fast relational lookup, purchase linking, and sort
         supplierCollection.createIndex({ createdAt: -1 }).catch(() => { });
         purchaseCollection.createIndex({ supplierId: 1 }).catch(() => { });
+        purchaseCollection.createIndex({ createdAt: -1 }).catch(() => { });
+        purchaseCollection.createIndex({ purchaseDate: -1 }).catch(() => { });
+        purchaseCollection.createIndex({ invoiceNo: 1 }).catch(() => { });
+        purchaseCollection.createIndex({ supplierName: 1 }).catch(() => { });
+        purchaseCollection.createIndex({ productName: 1 }).catch(() => { });
+        purchaseCollection.createIndex({ productId: 1 }).catch(() => { });
+        purchaseCollection.createIndex({ totalCost: -1 }).catch(() => { });
+        purchaseCollection.createIndex({ totalQuantity: -1 }).catch(() => { });
         productCollection.createIndex({ "variants.batches.supplierId": 1 }).catch(() => { });
 
         // GET /sales/report -> High performance aggregation API for sales report, filters, stats, & pagination
@@ -63,6 +72,7 @@ async function connectToMongoDB() {
                     paymentMethod,
                     orderStatus,
                     returnStatus,
+                    priceType,
                     minAmount,
                     maxAmount,
                     category,
@@ -158,6 +168,17 @@ async function connectToMongoDB() {
                 if (category && category !== 'all') {
                     hasActiveFilters = true;
                     andConditions.push({ "items.category": category });
+                }
+
+                // 9. Price Type filter (mrp vs retailPrice)
+                if (priceType && priceType !== 'all') {
+                    hasActiveFilters = true;
+                    andConditions.push({
+                        $or: [
+                            { priceType: priceType },
+                            { "items.priceType": priceType }
+                        ]
+                    });
                 }
 
                 const matchQuery = andConditions.length > 0 ? { $and: andConditions } : {};
@@ -282,6 +303,571 @@ async function connectToMongoDB() {
             }
         });
 
+        // GET /overview -> Executive overview dashboard statistics, velocity trend, and real-time operations
+        // High-performance light-speed API leveraging MongoDB Aggregation Pipelines with $facet & $group
+        app.get("/overview", async (req, res) => {
+            try {
+                const { date, days, timeZone: requestedTimeZone } = req.query;
+                const timeZone = requestedTimeZone || 'Asia/Dhaka';
+                const now = new Date();
+
+                // 1. Determine Target "Today" and "Yesterday"
+                let targetDateObj;
+                if (date && /^\d{4}-\d{2}-\d{2}$/.test(date)) {
+                    const [y, m, d] = date.split('-').map(Number);
+                    targetDateObj = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+                } else if (date) {
+                    targetDateObj = new Date(date);
+                    if (isNaN(targetDateObj.getTime())) {
+                        targetDateObj = now;
+                    }
+                } else {
+                    targetDateObj = now;
+                }
+
+                const todayStr = targetDateObj.toLocaleDateString('en-CA', { timeZone });
+
+                // Yesterday relative to todayStr
+                const [tY, tM, tD] = todayStr.split('-').map(Number);
+                const yesterdayObj = new Date(Date.UTC(tY, tM - 1, tD - 1, 12, 0, 0));
+                const yesterdayStr = yesterdayObj.toLocaleDateString('en-CA', { timeZone });
+
+                const daysCount = Math.max(1, Math.min(90, parseInt(days, 10) || 7));
+                const startTrendObj = new Date(Date.UTC(tY, tM - 1, tD - daysCount + 1, 12, 0, 0));
+                const startTrendStr = startTrendObj.toLocaleDateString('en-CA', { timeZone });
+
+                // 2. High-Performance Parallel MongoDB Aggregations
+                const [salesAggResult, productAggResult, categoryCount, supplierCount] = await Promise.all([
+                    salesCollection.aggregate([
+                        {
+                            $addFields: {
+                                dateObj: { $toDate: { $ifNull: ['$createdAt', '$saleDate'] } },
+                                dateStr: {
+                                    $dateToString: {
+                                        format: '%Y-%m-%d',
+                                        date: { $toDate: { $ifNull: ['$createdAt', '$saleDate'] } },
+                                        timezone: timeZone
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            $facet: {
+                                today: [
+                                    { $match: { dateStr: todayStr } },
+                                    {
+                                        $group: {
+                                            _id: null,
+                                            totalSales: { $sum: { $ifNull: ['$totalPayable', 0] } },
+                                            totalCollection: { $sum: { $ifNull: ['$paidAmount', 0] } },
+                                            totalDue: { $sum: { $ifNull: ['$dueAmount', 0] } },
+                                            soldUnits: { $sum: { $ifNull: ['$totalCartItems', 1] } },
+                                            ordersCount: { $sum: 1 },
+                                            itemsList: { $push: '$items' },
+                                            duePaymentsList: { $push: '$duePayments' }
+                                        }
+                                    }
+                                ],
+                                yesterday: [
+                                    { $match: { dateStr: yesterdayStr } },
+                                    {
+                                        $group: {
+                                            _id: null,
+                                            totalSales: { $sum: { $ifNull: ['$totalPayable', 0] } },
+                                            totalCollection: { $sum: { $ifNull: ['$paidAmount', 0] } },
+                                            totalDue: { $sum: { $ifNull: ['$dueAmount', 0] } },
+                                            soldUnits: { $sum: { $ifNull: ['$totalCartItems', 1] } },
+                                            ordersCount: { $sum: 1 },
+                                            itemsList: { $push: '$items' },
+                                            duePaymentsList: { $push: '$duePayments' }
+                                        }
+                                    }
+                                ],
+                                todayProducts: [
+                                    { $match: { dateStr: todayStr } },
+                                    { $unwind: '$items' },
+                                    { $sort: { dateObj: -1 } },
+                                    {
+                                        $lookup: {
+                                            from: 'products',
+                                            let: {
+                                                pId: {
+                                                    $convert: {
+                                                        input: '$items.productId',
+                                                        to: 'objectId',
+                                                        onError: null,
+                                                        onNull: null
+                                                    }
+                                                }
+                                            },
+                                            pipeline: [
+                                                { $match: { $expr: { $eq: ['$_id', '$$pId'] } } },
+                                                { $project: { category: 1, image: 1, images: 1, variants: 1 } }
+                                            ],
+                                            as: 'prodInfo'
+                                        }
+                                    },
+                                    {
+                                        $project: {
+                                            _id: 0,
+                                            saleId: '$_id',
+                                            productId: '$items.productId',
+                                            name: '$items.name',
+                                            brand: { $ifNull: ['$items.brand', ''] },
+                                            category: {
+                                                $ifNull: [
+                                                    '$items.category',
+                                                    { $arrayElemAt: ['$prodInfo.category', 0] },
+                                                    'General'
+                                                ]
+                                            },
+                                            variantTitle: { $ifNull: ['$items.variantTitle', 'Standard'] },
+                                            barcode: { $ifNull: ['$items.barcode', ''] },
+                                            quantity: { $ifNull: ['$items.quantity', 1] },
+                                            unitPrice: { $ifNull: ['$items.unitPrice', '$items.total', 0] },
+                                            total: { $ifNull: ['$items.total', 0] },
+                                            image: {
+                                                $ifNull: [
+                                                    '$items.image',
+                                                    { $arrayElemAt: [{ $arrayElemAt: ['$prodInfo.images.url', 0] }, 0] },
+                                                    { $arrayElemAt: ['$prodInfo.image', 0] },
+                                                    { $arrayElemAt: ['$prodInfo.variants.image', 0] },
+                                                    ''
+                                                ]
+                                            },
+                                            invoiceNo: '$invoiceNo',
+                                            paymentMethod: { $ifNull: ['$paymentMethod', 'Cash'] },
+                                            paymentStatus: { $ifNull: ['$paymentStatus', 'paid'] },
+                                            time: {
+                                                $dateToString: {
+                                                    format: '%H:%M',
+                                                    date: '$dateObj',
+                                                    timezone: timeZone
+                                                }
+                                            },
+                                            saleDate: '$dateObj'
+                                        }
+                                    }
+                                ],
+                                trend: [
+                                    { $match: { dateStr: { $gte: startTrendStr, $lte: todayStr } } },
+                                    {
+                                        $group: {
+                                            _id: '$dateStr',
+                                            sales: { $sum: { $ifNull: ['$totalPayable', 0] } },
+                                            collection: { $sum: { $ifNull: ['$paidAmount', 0] } },
+                                            orders: { $sum: 1 },
+                                            units: { $sum: { $ifNull: ['$totalCartItems', 1] } }
+                                        }
+                                    },
+                                    { $sort: { _id: 1 } }
+                                ],
+                                topProducts: [
+                                    { $unwind: '$items' },
+                                    {
+                                        $group: {
+                                            _id: { $ifNull: ['$items.productId', '$items.name'] },
+                                            productId: { $first: '$items.productId' },
+                                            name: { $first: '$items.name' },
+                                            brand: { $first: { $ifNull: ['$items.brand', ''] } },
+                                            category: { $first: { $ifNull: ['$items.category', 'General'] } },
+                                            image: { $first: { $ifNull: ['$items.image', ''] } },
+                                            unitsSold: { $sum: { $ifNull: ['$items.quantity', 1] } },
+                                            totalRevenue: {
+                                                $sum: {
+                                                    $ifNull: [
+                                                        '$items.total',
+                                                        { $multiply: [{ $ifNull: ['$items.unitPrice', 0] }, { $ifNull: ['$items.quantity', 1] }] },
+                                                        0
+                                                    ]
+                                                }
+                                            }
+                                        }
+                                    },
+                                    { $sort: { totalRevenue: -1 } },
+                                    { $limit: 10 }
+                                ],
+                                recentInvoices: [
+                                    { $sort: { dateObj: -1 } },
+                                    { $limit: 10 },
+                                    {
+                                        $project: {
+                                            _id: 1,
+                                            invoiceNo: 1,
+                                            customerName: { $ifNull: ['$customer.name', 'Walk-In Customer'] },
+                                            customerPhone: { $ifNull: ['$customer.phone', ''] },
+                                            date: '$dateObj',
+                                            totalPayable: { $ifNull: ['$totalPayable', 0] },
+                                            paidAmount: { $ifNull: ['$paidAmount', 0] },
+                                            dueAmount: { $ifNull: ['$dueAmount', 0] },
+                                            paymentMethod: { $ifNull: ['$paymentMethod', 'Cash'] },
+                                            paymentStatus: { $ifNull: ['$paymentStatus', 'paid'] },
+                                            orderStatus: { $ifNull: ['$orderStatus', 'completed'] },
+                                            itemsCount: { $ifNull: ['$totalCartItems', 1] },
+                                            itemSummary: {
+                                                $reduce: {
+                                                    input: { $slice: [{ $ifNull: ['$items.name', []] }, 2] },
+                                                    initialValue: '',
+                                                    in: {
+                                                        $cond: [
+                                                            { $eq: ['$$value', ''] },
+                                                            '$$this',
+                                                            { $concat: ['$$value', ', ', '$$this'] }
+                                                        ]
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                ],
+                                lifetimeSummary: [
+                                    {
+                                        $group: {
+                                            _id: null,
+                                            totalRevenue: { $sum: { $ifNull: ['$totalPayable', 0] } },
+                                            totalCollection: { $sum: { $ifNull: ['$paidAmount', 0] } },
+                                            totalDue: { $sum: { $ifNull: ['$dueAmount', 0] } },
+                                            totalOrders: { $sum: 1 }
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ]).toArray(),
+                    productCollection.aggregate([
+                        { $match: { status: { $ne: 'deleted' } } },
+                        {
+                            $addFields: {
+                                computedStock: {
+                                    $cond: [
+                                        { $isArray: '$variants' },
+                                        { $sum: '$variants.quantity' },
+                                        { $ifNull: ['$quantity', 0] }
+                                    ]
+                                },
+                                effectiveMinStock: { $ifNull: ['$minStockLevel', 5] },
+                                // Extract first valid batch supplier name
+                                firstBatchSupplierName: {
+                                    $arrayElemAt: [
+                                        {
+                                            $filter: {
+                                                input: {
+                                                    $reduce: {
+                                                        input: { $ifNull: ['$variants', []] },
+                                                        initialValue: [],
+                                                        in: {
+                                                            $concatArrays: [
+                                                                '$$value',
+                                                                {
+                                                                    $map: {
+                                                                        input: { $ifNull: ['$$this.batches', []] },
+                                                                        as: 'b',
+                                                                        in: '$$b.supplierName'
+                                                                    }
+                                                                }
+                                                            ]
+                                                        }
+                                                    }
+                                                },
+                                                as: 'sn',
+                                                cond: { $and: [{ $ne: ['$$sn', null] }, { $ne: ['$$sn', ''] }] }
+                                            }
+                                        },
+                                        0
+                                    ]
+                                }
+                            }
+                        },
+                        {
+                            $facet: {
+                                alerts: [
+                                    {
+                                        $match: {
+                                            $expr: { $lte: ['$computedStock', '$effectiveMinStock'] }
+                                        }
+                                    },
+                                    // Robust category lookup handling both string and ObjectId formats
+                                    {
+                                        $lookup: {
+                                            from: 'categories',
+                                            let: { catId: '$category' },
+                                            pipeline: [
+                                                {
+                                                    $match: {
+                                                        $expr: {
+                                                            $or: [
+                                                                { $eq: ['$_id', '$$catId'] },
+                                                                { $eq: [{ $toString: '$_id' }, { $toString: '$$catId' }] },
+                                                                { $eq: ['$name', '$$catId'] }
+                                                            ]
+                                                        }
+                                                    }
+                                                }
+                                            ],
+                                            as: 'categoryDoc'
+                                        }
+                                    },
+                                    {
+                                        $project: {
+                                            _id: 0,
+                                            productId: '$_id',
+                                            name: 1,
+                                            brand: { $ifNull: ['$brand', ''] },
+                                            category: {
+                                                $ifNull: [
+                                                    { $arrayElemAt: ['$categoryDoc.name', 0] },
+                                                    '$categoryName',
+                                                    'General'
+                                                ]
+                                            },
+                                            stock: '$computedStock',
+                                            minStockLevel: '$effectiveMinStock',
+                                            status: {
+                                                $cond: [
+                                                    { $lte: ['$computedStock', 0] },
+                                                    'OUT_OF_STOCK',
+                                                    'LOW_STOCK'
+                                                ]
+                                            },
+                                            supplierName: {
+                                                $ifNull: [
+                                                    '$firstBatchSupplierName',
+                                                    '$supplierName',
+                                                    '$supplier',
+                                                    'Primary Vendor'
+                                                ]
+                                            },
+                                            image: {
+                                                $ifNull: [
+                                                    { $arrayElemAt: ['$images.url', 0] },
+                                                    {
+                                                        $cond: [
+                                                            { $eq: [{ $type: { $arrayElemAt: ['$images', 0] } }, 'string'] },
+                                                            { $arrayElemAt: ['$images', 0] },
+                                                            null
+                                                        ]
+                                                    },
+                                                    { $arrayElemAt: ['$variants.image', 0] },
+                                                    '$image',
+                                                    ''
+                                                ]
+                                            }
+                                        }
+                                    },
+                                    { $sort: { stock: 1 } },
+                                    { $limit: 10 }
+                                ],
+                                stockSummary: [
+                                    {
+                                        $group: {
+                                            _id: null,
+                                            totalCatalogProducts: { $sum: 1 },
+                                            totalStockUnits: { $sum: '$computedStock' }
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ]).toArray(),
+                    categoryCollection.countDocuments(),
+                    supplierCollection.countDocuments()
+                ]);
+
+                const sFacet = salesAggResult[0] || {};
+                const pFacet = productAggResult[0] || {};
+
+                // 3. Process Tier 1: Today vs Yesterday
+                const todayData = sFacet.today?.[0] || { totalSales: 0, totalCollection: 0, totalDue: 0, soldUnits: 0, itemsList: [] };
+                const yesterdayData = sFacet.yesterday?.[0] || { totalSales: 0, totalCollection: 0, totalDue: 0, soldUnits: 0, itemsList: [] };
+
+                const todaySales = todayData.totalSales;
+                const todayCollection = todayData.totalCollection;
+                const soldUnits = todayData.soldUnits;
+                const todayProducts = sFacet.todayProducts || [];
+
+                // Count unique products sold today
+                const uniqueProductsSold = new Set(
+                    todayProducts.map(p => (p.productId ? p.productId.toString() : p.name))
+                ).size;
+
+                // Due collection calculation
+                let todayDueCollection = 0;
+                if (Array.isArray(todayData.duePaymentsList)) {
+                    todayData.duePaymentsList.flat().forEach(dp => {
+                        if (dp && dp.amount) todayDueCollection += Number(dp.amount) || 0;
+                    });
+                }
+
+                let yesterdayDueCollection = 0;
+                if (Array.isArray(yesterdayData.duePaymentsList)) {
+                    yesterdayData.duePaymentsList.flat().forEach(dp => {
+                        if (dp && dp.amount) yesterdayDueCollection += Number(dp.amount) || 0;
+                    });
+                }
+
+                const yesterdaySales = yesterdayData.totalSales;
+                const yesterdayCollection = yesterdayData.totalCollection;
+                const yesterdaySoldUnits = yesterdayData.soldUnits;
+                const yesterdayUniqueProductsSold = (yesterdayData.itemsList || [])
+                    .flat()
+                    .filter(Boolean)
+                    .reduce((set, it) => set.add(it.productId ? it.productId.toString() : it.name), new Set())
+                    .size;
+
+                // Percentage change calculator (+/- vs yesterday)
+                const calcPercentageChange = (current, previous) => {
+                    if (!previous || previous === 0) {
+                        if (!current || current === 0) return { change: 0, direction: 'flat', formatted: '0%', raw: 0 };
+                        return { change: 100, direction: 'up', formatted: '+100%', raw: 100 };
+                    }
+                    const diff = ((current - previous) / previous) * 100;
+                    const rounded = Math.round(diff * 10) / 10;
+                    const direction = rounded > 0 ? 'up' : rounded < 0 ? 'down' : 'flat';
+                    const formatted = (rounded > 0 ? '+' : '') + rounded + '%';
+                    return { change: Math.abs(rounded), direction, formatted, raw: rounded };
+                };
+
+                // 4. Process Tier 2: Sales Velocity Trend (complete array without missing days)
+                const trendMap = new Map((sFacet.trend || []).map(t => [t._id, t]));
+                const points = [];
+                let trendTotalRevenue = 0;
+                let trendTotalOrders = 0;
+                let peakDay = { date: '', label: '', sales: 0 };
+
+                for (let i = daysCount - 1; i >= 0; i--) {
+                    const dObj = new Date(Date.UTC(tY, tM - 1, tD - i, 12, 0, 0));
+                    const dStr = dObj.toLocaleDateString('en-CA', { timeZone });
+                    const label = dObj.toLocaleDateString('en-US', { month: 'short', day: '2-digit', timeZone });
+                    const dayName = dObj.toLocaleDateString('en-US', { weekday: 'short', timeZone });
+                    const match = trendMap.get(dStr);
+                    const sales = match ? match.sales : 0;
+                    const collection = match ? match.collection : 0;
+                    const orders = match ? match.orders : 0;
+                    const units = match ? match.units : 0;
+
+                    trendTotalRevenue += sales;
+                    trendTotalOrders += orders;
+                    if (sales >= peakDay.sales) {
+                        peakDay = { date: dStr, label, sales };
+                    }
+
+                    points.push({
+                        date: dStr,
+                        label,
+                        dayName,
+                        sales,
+                        collection,
+                        orders,
+                        units
+                    });
+                }
+
+                // 5. Process Tier 3: Overall Leaderboard & Inventory Alerts
+                const lifetimeTotal = sFacet.lifetimeSummary?.[0]?.totalRevenue || 0;
+                const topSellingProducts = (sFacet.topProducts || []).map((p, idx) => ({
+                    rank: idx + 1,
+                    ...p,
+                    revenueShare: lifetimeTotal > 0 ? Math.round((p.totalRevenue / lifetimeTotal) * 1000) / 10 : 0
+                }));
+
+                const alerts = pFacet.alerts || [];
+                const outOfStockCount = alerts.filter(a => a.status === 'OUT_OF_STOCK').length;
+                const lowStockCount = alerts.filter(a => a.status === 'LOW_STOCK').length;
+
+                // Prepared Store Summary mapped for both naming conventions
+                const storeSummaryData = {
+                    catalogProducts: pFacet.stockSummary?.[0]?.totalCatalogProducts || 0,
+                    warehouseUnits: pFacet.stockSummary?.[0]?.totalStockUnits || 0,
+                    totalCatalogProducts: pFacet.stockSummary?.[0]?.totalCatalogProducts || 0,
+                    totalStockUnits: pFacet.stockSummary?.[0]?.totalStockUnits || 0,
+                    totalCategories: categoryCount || 0,
+                    totalSuppliers: supplierCount || 0,
+                    lifetimeRevenue: lifetimeTotal,
+                    lifetimeCollection: sFacet.lifetimeSummary?.[0]?.totalCollection || 0,
+                    lifetimePaid: sFacet.lifetimeSummary?.[0]?.totalCollection || 0,
+                    lifetimeDue: sFacet.lifetimeSummary?.[0]?.totalDue || 0,
+                    lifetimeOrders: sFacet.lifetimeSummary?.[0]?.totalOrders || 0
+                };
+
+                // Prepared Sales Trend with summary sub-object
+                const salesTrendData = {
+                    days: daysCount,
+                    timeframe: `Last ${daysCount} Days`,
+                    totalRevenue: trendTotalRevenue,
+                    dailyAverage: Math.round(trendTotalRevenue / daysCount),
+                    totalOrders: trendTotalOrders,
+                    peakDay,
+                    summary: {
+                        totalRevenue: trendTotalRevenue,
+                        dailyAverage: Math.round(trendTotalRevenue / daysCount),
+                        totalOrders: trendTotalOrders,
+                        peakDay
+                    },
+                    points
+                };
+
+                res.send({
+                    success: true,
+                    timeZone,
+                    date: todayStr,
+                    todayStats: {
+                        todaySales,
+                        todayCollection,
+                        dueCollection: todayDueCollection,
+                        soldUnits,
+                        uniqueProductsSold,
+                        yesterdaySales,
+                        yesterdayCollection,
+                        yesterdayDueCollection,
+                        yesterdaySoldUnits,
+                        yesterdayUniqueProductsSold,
+                        percentageChanges: {
+                            sales: calcPercentageChange(todaySales, yesterdaySales),
+                            collection: calcPercentageChange(todayCollection, yesterdayCollection),
+                            dueCollection: calcPercentageChange(todayDueCollection, yesterdayDueCollection),
+                            soldUnits: calcPercentageChange(soldUnits, yesterdaySoldUnits),
+                            uniqueProductsSold: calcPercentageChange(uniqueProductsSold, yesterdayUniqueProductsSold)
+                        }
+                    },
+                    salesTrend: salesTrendData,
+                    todaySoldProducts: {
+                        summary: {
+                            totalUnitsSold: soldUnits,
+                            uniqueProductLines: uniqueProductsSold,
+                            totalRevenue: todaySales
+                        },
+                        items: todayProducts,
+                        products: todayProducts
+                    },
+                    // Exposed directly for frontend top-level access
+                    topSellingProducts,
+                    recentInvoices: sFacet.recentInvoices || [],
+                    actionRequired: alerts,
+                    storeSummary: storeSummaryData,
+
+                    // Retained under overall for complete backward compatibility
+                    overall: {
+                        topSellingProducts,
+                        recentInvoices: sFacet.recentInvoices || [],
+                        actionRequired: {
+                            totalAlerts: alerts.length,
+                            outOfStockCount,
+                            lowStockCount,
+                            alerts
+                        },
+                        storeSummary: storeSummaryData
+                    }
+                });
+            } catch (err) {
+                console.error("Error generating overview stats via aggregation:", err);
+                res.status(500).send({
+                    success: false,
+                    message: "Failed to generate overview statistics",
+                    error: err.message
+                });
+            }
+        });
+
 
         // ====================================================================================================
         // * ------------------------------------------- Sales APIs  ------------------------------------------
@@ -314,6 +900,16 @@ async function connectToMongoDB() {
                         randomCode += chars[crypto.randomInt(0, chars.length)];
                     }
                     return `IN-${randomCode}`;
+                }
+
+                // Ensure priceType is set consistently for whole invoice and all items
+                const invoicePriceType = saleData.priceType || 'mrp';
+                saleData.priceType = invoicePriceType;
+                if (Array.isArray(saleData.items)) {
+                    saleData.items = saleData.items.map(item => ({
+                        ...item,
+                        priceType: invoicePriceType
+                    }));
                 }
 
                 saleData.invoiceNo = generateInvoiceNo();
@@ -1895,14 +2491,463 @@ async function connectToMongoDB() {
         // * ------------------------------------ PURCHASE APIs (purchases) -------------------------------------
         // ====================================================================================================
 
-        // GET /purchases -> Retrieve all purchase inventory transactions and invoice records
+        // GET /purchases -> High performance aggregation API for purchase records, filters, stats, & pagination
         app.get("/purchases", async (req, res) => {
             try {
-                const result = await purchaseCollection.find().toArray();
-                res.send(result);
+                const {
+                    search,
+                    startDate,
+                    endDate,
+                    supplierId,
+                    condition,
+                    hasImei,
+                    minAmount,
+                    maxAmount,
+                    page,
+                    limit,
+                    sortBy,
+                    sortOrder,
+                    raw
+                } = req.query;
+
+                // Support raw array query if requested
+                if (raw === "true") {
+                    const rawPurchases = await purchaseCollection.find().sort({ createdAt: -1 }).toArray();
+                    return res.send(rawPurchases);
+                }
+
+                const andConditions = [];
+                let hasActiveFilters = false;
+
+                // 1. Date range filter on purchaseDate / createdAt
+                if (startDate || endDate) {
+                    hasActiveFilters = true;
+                    if (startDate && endDate) {
+                        const s = new Date(startDate);
+                        s.setHours(0, 0, 0, 0);
+                        const e = new Date(endDate);
+                        e.setHours(23, 59, 59, 999);
+                        const sStr = startDate.slice(0, 10);
+                        const eStr = endDate.slice(0, 10);
+                        andConditions.push({
+                            $or: [
+                                { purchaseDate: { $gte: sStr, $lte: eStr } },
+                                { purchaseDate: { $gte: s, $lte: e } },
+                                { createdAt: { $gte: s, $lte: e } }
+                            ]
+                        });
+                    } else if (startDate) {
+                        const s = new Date(startDate);
+                        s.setHours(0, 0, 0, 0);
+                        const sStr = startDate.slice(0, 10);
+                        andConditions.push({
+                            $or: [
+                                { purchaseDate: { $gte: sStr } },
+                                { purchaseDate: { $gte: s } },
+                                { createdAt: { $gte: s } }
+                            ]
+                        });
+                    } else if (endDate) {
+                        const e = new Date(endDate);
+                        e.setHours(23, 59, 59, 999);
+                        const eStr = endDate.slice(0, 10);
+                        andConditions.push({
+                            $or: [
+                                { purchaseDate: { $lte: eStr } },
+                                { purchaseDate: { $lte: e } },
+                                { createdAt: { $lte: e } }
+                            ]
+                        });
+                    }
+                }
+
+                // 2. Global search filter across invoice #, product name, supplier, condition, barcode, and IMEIs
+                if (search && search.trim()) {
+                    hasActiveFilters = true;
+                    const clean = search.trim();
+                    const regex = new RegExp(clean.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+                    andConditions.push({
+                        $or: [
+                            { invoiceNo: regex },
+                            { productName: regex },
+                            { supplier: regex },
+                            { supplierName: regex },
+                            { condition: regex },
+                            { "variants.title": regex },
+                            { "variants.barcode": regex },
+                            { "variants.imeis.imei1": regex },
+                            { "variants.imeis.imei2": regex }
+                        ]
+                    });
+                }
+
+                // 3. Supplier filter (by supplierId or supplierName)
+                if (supplierId && supplierId !== 'all') {
+                    hasActiveFilters = true;
+                    const orSupplier = [{ supplierId: supplierId }];
+                    if (ObjectId.isValid(supplierId)) {
+                        orSupplier.push({ supplierId: new ObjectId(supplierId) });
+                    }
+                    const cleanSup = supplierId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                    orSupplier.push({ supplierName: new RegExp(`^${cleanSup}$`, 'i') });
+                    orSupplier.push({ supplier: new RegExp(`^${cleanSup}$`, 'i') });
+                    andConditions.push({ $or: orSupplier });
+                }
+
+                // 4. Condition filter (new, refurbished, used)
+                if (condition && condition !== 'all') {
+                    hasActiveFilters = true;
+                    andConditions.push({ condition: condition.toLowerCase() });
+                }
+
+                // 5. Has IMEI tracking filter
+                if (hasImei && hasImei !== 'all') {
+                    hasActiveFilters = true;
+                    if (hasImei === 'true' || hasImei === true) {
+                        andConditions.push({ hasImei: true });
+                    } else {
+                        andConditions.push({
+                            $or: [{ hasImei: false }, { hasImei: { $exists: false } }]
+                        });
+                    }
+                }
+
+                // 6. Total cost amount range filter
+                if (minAmount !== undefined && minAmount !== '' && !isNaN(Number(minAmount))) {
+                    hasActiveFilters = true;
+                    andConditions.push({ totalCost: { $gte: Number(minAmount) } });
+                }
+                if (maxAmount !== undefined && maxAmount !== '' && !isNaN(Number(maxAmount))) {
+                    hasActiveFilters = true;
+                    andConditions.push({ totalCost: { $lte: Number(maxAmount) } });
+                }
+
+                // Pagination & Sorting setup
+                const pageNum = Math.max(1, parseInt(page, 10) || 1);
+                const limitNum = Math.max(1, Math.min(200, parseInt(limit, 10) || 10));
+                const skipNum = (pageNum - 1) * limitNum;
+
+                const allowedSortFields = [
+                    'createdAt',
+                    'purchaseDate',
+                    'totalCost',
+                    'totalQuantity',
+                    'productName',
+                    'supplierName',
+                    'invoiceNo'
+                ];
+                const sortField = allowedSortFields.includes(sortBy) ? sortBy : 'createdAt';
+                const sortDirection = sortOrder === 'asc' ? 1 : -1;
+
+                // Robust fallback enrichment for any older legacy documents
+                const enrichmentStages = [
+                    {
+                        $addFields: {
+                            totalQuantity: {
+                                $ifNull: [
+                                    "$totalQuantity",
+                                    {
+                                        $reduce: {
+                                            input: { $ifNull: ["$variants", []] },
+                                            initialValue: 0,
+                                            in: { $add: ["$$value", { $toDouble: { $ifNull: ["$$this.quantity", 0] } }] }
+                                        }
+                                    }
+                                ]
+                            },
+                            subtotal: {
+                                $ifNull: [
+                                    "$subtotal",
+                                    {
+                                        $reduce: {
+                                            input: { $ifNull: ["$variants", []] },
+                                            initialValue: 0,
+                                            in: {
+                                                $add: [
+                                                    "$$value",
+                                                    {
+                                                        $multiply: [
+                                                            { $toDouble: { $ifNull: ["$$this.quantity", 0] } },
+                                                            { $toDouble: { $ifNull: ["$$this.purchasePrice", 0] } }
+                                                        ]
+                                                    }
+                                                ]
+                                            }
+                                        }
+                                    }
+                                ]
+                            },
+                            shippingCost: { $toDouble: { $ifNull: ["$shippingCost", 0] } },
+                            extraCost: { $toDouble: { $ifNull: ["$extraCost", 0] } }
+                        }
+                    },
+                    {
+                        $addFields: {
+                            totalCost: {
+                                $ifNull: [
+                                    "$totalCost",
+                                    { $add: ["$subtotal", "$shippingCost", "$extraCost"] }
+                                ]
+                            },
+                            supplierName: { $ifNull: ["$supplierName", "$supplier"] },
+                            totalVariants: { $size: { $ifNull: ["$variants", []] } }
+                        }
+                    }
+                ];
+
+                const matchStage = andConditions.length > 0 ? [{ $match: { $and: andConditions } }] : [];
+
+                // High-performance aggregation pipeline with $facet
+                const pipeline = [
+                    ...enrichmentStages,
+                    ...matchStage,
+                    {
+                        $facet: {
+                            summary: [
+                                {
+                                    $group: {
+                                        _id: null,
+                                        totalPurchases: { $sum: 1 },
+                                        totalInvestment: { $sum: { $ifNull: ["$totalCost", 0] } },
+                                        totalQuantity: { $sum: { $ifNull: ["$totalQuantity", 0] } },
+                                        totalSubtotal: { $sum: { $ifNull: ["$subtotal", 0] } },
+                                        totalShipping: { $sum: { $ifNull: ["$shippingCost", 0] } },
+                                        totalExtra: { $sum: { $ifNull: ["$extraCost", 0] } },
+                                        avgPurchaseCost: { $avg: { $ifNull: ["$totalCost", 0] } },
+                                        uniqueSuppliers: { $addToSet: "$supplierName" },
+                                        uniqueProducts: { $addToSet: "$productName" }
+                                    }
+                                },
+                                {
+                                    $project: {
+                                        _id: 0,
+                                        totalPurchases: 1,
+                                        totalInvestment: { $round: ["$totalInvestment", 2] },
+                                        totalQuantity: 1,
+                                        totalSubtotal: { $round: ["$totalSubtotal", 2] },
+                                        totalShipping: { $round: ["$totalShipping", 2] },
+                                        totalExtra: { $round: ["$totalExtra", 2] },
+                                        avgPurchaseCost: { $round: ["$avgPurchaseCost", 2] },
+                                        uniqueSuppliersCount: { $size: "$uniqueSuppliers" },
+                                        uniqueProductsCount: { $size: "$uniqueProducts" }
+                                    }
+                                }
+                            ],
+                            purchases: [
+                                { $sort: { [sortField]: sortDirection } },
+                                { $skip: skipNum },
+                                { $limit: limitNum },
+                                {
+                                    $lookup: {
+                                        from: "products",
+                                        let: { pId: "$productId" },
+                                        pipeline: [
+                                            {
+                                                $match: {
+                                                    $expr: {
+                                                        $or: [
+                                                            { $eq: ["$_id", "$$pId"] },
+                                                            { $eq: [{ $toString: "$_id" }, { $toString: "$$pId" }] }
+                                                        ]
+                                                    }
+                                                }
+                                            },
+                                            {
+                                                $project: {
+                                                    _id: 1,
+                                                    name: 1,
+                                                    brand: 1,
+                                                    category: 1,
+                                                    thumbnail: { $arrayElemAt: ["$images.url", 0] }
+                                                }
+                                            }
+                                        ],
+                                        as: "productInfo"
+                                    }
+                                },
+                                {
+                                    $addFields: {
+                                        productThumbnail: { $arrayElemAt: ["$productInfo.thumbnail", 0] },
+                                        productBrand: { $arrayElemAt: ["$productInfo.brand", 0] }
+                                    }
+                                },
+                                {
+                                    $project: { productInfo: 0 }
+                                }
+                            ]
+                        }
+                    }
+                ];
+
+                // Overall lifetime summary (unfiltered stats) for baseline KPI cards
+                const overallPipeline = [
+                    ...enrichmentStages,
+                    {
+                        $group: {
+                            _id: null,
+                            totalPurchases: { $sum: 1 },
+                            totalInvestment: { $sum: { $ifNull: ["$totalCost", 0] } },
+                            totalQuantity: { $sum: { $ifNull: ["$totalQuantity", 0] } },
+                            totalSubtotal: { $sum: { $ifNull: ["$subtotal", 0] } },
+                            totalShipping: { $sum: { $ifNull: ["$shippingCost", 0] } },
+                            totalExtra: { $sum: { $ifNull: ["$extraCost", 0] } },
+                            avgPurchaseCost: { $avg: { $ifNull: ["$totalCost", 0] } },
+                            uniqueSuppliers: { $addToSet: "$supplierName" },
+                            uniqueProducts: { $addToSet: "$productName" }
+                        }
+                    },
+                    {
+                        $project: {
+                            _id: 0,
+                            totalPurchases: 1,
+                            totalInvestment: { $round: ["$totalInvestment", 2] },
+                            totalQuantity: 1,
+                            totalSubtotal: { $round: ["$totalSubtotal", 2] },
+                            totalShipping: { $round: ["$totalShipping", 2] },
+                            totalExtra: { $round: ["$totalExtra", 2] },
+                            avgPurchaseCost: { $round: ["$avgPurchaseCost", 2] },
+                            uniqueSuppliersCount: { $size: "$uniqueSuppliers" },
+                            uniqueProductsCount: { $size: "$uniqueProducts" }
+                        }
+                    }
+                ];
+
+                const [facetResult, overallResult] = await Promise.all([
+                    purchaseCollection.aggregate(pipeline).toArray(),
+                    purchaseCollection.aggregate(overallPipeline).toArray()
+                ]);
+
+                const facetData = facetResult[0] || { summary: [], purchases: [] };
+                const defaultSummary = {
+                    totalPurchases: 0,
+                    totalInvestment: 0,
+                    totalQuantity: 0,
+                    totalSubtotal: 0,
+                    totalShipping: 0,
+                    totalExtra: 0,
+                    avgPurchaseCost: 0,
+                    uniqueSuppliersCount: 0,
+                    uniqueProductsCount: 0
+                };
+
+                const filteredStats = facetData.summary[0] || defaultSummary;
+                const overallStats = overallResult[0] || defaultSummary;
+
+                const totalCount = filteredStats.totalPurchases;
+                const totalPages = Math.ceil(totalCount / limitNum) || 1;
+
+                res.send({
+                    success: true,
+                    purchases: facetData.purchases,
+                    filteredStats,
+                    overallStats,
+                    pagination: {
+                        totalCount,
+                        totalPages,
+                        currentPage: pageNum,
+                        limit: limitNum,
+                        hasNextPage: pageNum < totalPages,
+                        hasPrevPage: pageNum > 1
+                    },
+                    isFiltered: hasActiveFilters
+                });
             } catch (err) {
                 console.error("Error fetching purchases:", err);
-                res.status(500).send({ message: "Failed to fetch purchases" });
+                res.status(500).send({ message: "Failed to fetch purchases", error: err.message });
+            }
+        });
+
+        // GET /purchases/:id -> Retrieve complete single purchase record by ObjectId or invoiceNo
+        app.get("/purchases/:id", async (req, res) => {
+            try {
+                const { id } = req.params;
+                const orQuery = [{ invoiceNo: id }];
+                if (ObjectId.isValid(id)) {
+                    orQuery.push({ _id: new ObjectId(id) });
+                }
+
+                const pipeline = [
+                    { $match: { $or: orQuery } },
+                    {
+                        $lookup: {
+                            from: "suppliers",
+                            let: { sId: "$supplierId" },
+                            pipeline: [
+                                {
+                                    $match: {
+                                        $expr: {
+                                            $or: [
+                                                { $eq: ["$_id", "$$sId"] },
+                                                { $eq: [{ $toString: "$_id" }, { $toString: "$$sId" }] }
+                                            ]
+                                        }
+                                    }
+                                }
+                            ],
+                            as: "supplierDetails"
+                        }
+                    },
+                    {
+                        $lookup: {
+                            from: "products",
+                            let: { pId: "$productId" },
+                            pipeline: [
+                                {
+                                    $match: {
+                                        $expr: {
+                                            $or: [
+                                                { $eq: ["$_id", "$$pId"] },
+                                                { $eq: [{ $toString: "$_id" }, { $toString: "$$pId" }] }
+                                            ]
+                                        }
+                                    }
+                                }
+                            ],
+                            as: "productDetails"
+                        }
+                    },
+                    {
+                        $addFields: {
+                            supplierInfo: { $arrayElemAt: ["$supplierDetails", 0] },
+                            productInfo: { $arrayElemAt: ["$productDetails", 0] },
+                            supplierName: { $ifNull: ["$supplierName", "$supplier"] }
+                        }
+                    },
+                    {
+                        $project: {
+                            supplierDetails: 0,
+                            productDetails: 0
+                        }
+                    }
+                ];
+
+                const results = await purchaseCollection.aggregate(pipeline).toArray();
+                if (!results || results.length === 0) {
+                    return res.status(404).send({ message: "Purchase record not found" });
+                }
+
+                res.send(results[0]);
+            } catch (err) {
+                console.error("Error fetching purchase details:", err);
+                res.status(500).send({ message: "Failed to fetch purchase details" });
+            }
+        });
+
+        // DELETE /purchase/:id -> Remove a purchase invoice record
+        app.delete("/purchase/:id", async (req, res) => {
+            try {
+                const { id } = req.params;
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).send({ message: "Invalid purchase ID format" });
+                }
+                const result = await purchaseCollection.deleteOne({ _id: new ObjectId(id) });
+                if (result.deletedCount === 0) {
+                    return res.status(404).send({ message: "Purchase record not found" });
+                }
+                res.send({ success: true, message: "Purchase record deleted successfully" });
+            } catch (err) {
+                console.error("Error deleting purchase:", err);
+                res.status(500).send({ message: "Failed to delete purchase record" });
             }
         });
 
@@ -1932,12 +2977,40 @@ async function connectToMongoDB() {
                     }));
                 }
 
+                // Precompute summary metrics for light-speed query indexing
+                const purchasedVariants = Array.isArray(data.variants) ? data.variants : [];
+                let totalQty = 0;
+                let subtotal = 0;
+                let totalImeis = 0;
+
+                for (const v of purchasedVariants) {
+                    const q = Number(v.quantity) || 0;
+                    const p = Number(v.purchasePrice) || 0;
+                    totalQty += q;
+                    subtotal += q * p;
+                    if (Array.isArray(v.imeis)) {
+                        totalImeis += v.imeis.length;
+                    }
+                }
+
+                const shippingCost = Number(data.shippingCost) || 0;
+                const extraCost = Number(data.extraCost) || 0;
+                const totalCost = subtotal + shippingCost + extraCost;
+
+                data.totalQuantity = totalQty;
+                data.subtotal = subtotal;
+                data.shippingCost = shippingCost;
+                data.extraCost = extraCost;
+                data.totalCost = totalCost;
+                data.totalVariants = purchasedVariants.length;
+                data.totalImeis = totalImeis;
+                data.supplierName = data.supplierName || data.supplier || "";
+
                 // 1. Save the purchase record as an audit log
                 const result = await purchaseCollection.insertOne(data);
 
                 // 2. Merge purchased variants into the product collection (live stock source of truth)
                 const productId = data.productId;
-                const purchasedVariants = Array.isArray(data.variants) ? data.variants : [];
 
                 if (productId && ObjectId.isValid(productId) && purchasedVariants.length > 0) {
                     const productQuery = { _id: new ObjectId(productId) };
@@ -2404,3 +3477,4 @@ connectToMongoDB();
 app.listen(port, () => {
     console.log(`Example app listening on port ${port}`);
 });
+// Server reloaded
