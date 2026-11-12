@@ -50,6 +50,7 @@ async function connectToMongoDB() {
 
         // Supplier & Purchase indexes for fast relational lookup, purchase linking, and sort
         supplierCollection.createIndex({ createdAt: -1 }).catch(() => { });
+        supplierCollection.createIndex({ name: 1 }).catch(() => { });
         purchaseCollection.createIndex({ supplierId: 1 }).catch(() => { });
         purchaseCollection.createIndex({ createdAt: -1 }).catch(() => { });
         purchaseCollection.createIndex({ purchaseDate: -1 }).catch(() => { });
@@ -60,6 +61,10 @@ async function connectToMongoDB() {
         purchaseCollection.createIndex({ totalCost: -1 }).catch(() => { });
         purchaseCollection.createIndex({ totalQuantity: -1 }).catch(() => { });
         productCollection.createIndex({ "variants.batches.supplierId": 1 }).catch(() => { });
+        productCollection.createIndex({ "variants.batches.supplierName": 1 }).catch(() => { });
+        productCollection.createIndex({ "variants.batches.supplier": 1 }).catch(() => { });
+        productCollection.createIndex({ supplierName: 1 }).catch(() => { });
+        productCollection.createIndex({ supplier: 1 }).catch(() => { });
 
         // GET /sales/report -> High performance aggregation API for sales report, filters, stats, & pagination
         app.get("/sales/report", async (req, res) => {
@@ -1340,6 +1345,9 @@ async function connectToMongoDB() {
                 const {
                     search,
                     category,
+                    supplier,
+                    supplierName,
+                    supplierId,
                     stockStatus = "all",
                     status = "all",
                     page,
@@ -1353,7 +1361,7 @@ async function connectToMongoDB() {
                 const limitNum = Math.max(1, Math.min(100, parseInt(limit, 10) || 10));
                 const skipNum = (pageNum - 1) * limitNum;
 
-                // 1. Match Stage (Search & Category)
+                // 1. Match Stage (Search, Category, Status & Supplier)
                 const andConditions = [];
 
                 if (search && search.trim()) {
@@ -1385,6 +1393,60 @@ async function connectToMongoDB() {
 
                 if (status && status !== 'all' && status.trim()) {
                     andConditions.push({ status: status.trim() });
+                }
+
+                // Pre-resolve supplier IDs & names once so Stage 1 $match uses indexes directly (avoids full-collection $lookup)
+                const rawSupplier = (supplierName || supplier || supplierId || "").trim();
+                if (rawSupplier && rawSupplier.toLowerCase() !== "all") {
+                    const supplierIdCandidates = [];
+                    const supplierNameCandidates = [];
+                    const cleanSup = rawSupplier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                    const supplierRegex = new RegExp(cleanSup, 'i');
+
+                    if (ObjectId.isValid(rawSupplier)) {
+                        const supObjId = new ObjectId(rawSupplier);
+                        supplierIdCandidates.push(rawSupplier, supObjId);
+                        const supDoc = await supplierCollection.findOne(
+                            { _id: supObjId },
+                            { projection: { name: 1 } }
+                        );
+                        if (supDoc?.name) {
+                            supplierNameCandidates.push(supDoc.name);
+                        }
+                    } else {
+                        const matchedSuppliers = await supplierCollection
+                            .find({ name: supplierRegex }, { projection: { _id: 1, name: 1 } })
+                            .toArray();
+
+                        for (const s of matchedSuppliers) {
+                            supplierIdCandidates.push(s._id, s._id.toString());
+                            if (s.name) supplierNameCandidates.push(s.name);
+                        }
+                    }
+
+                    const supplierOrConditions = [];
+                    if (supplierIdCandidates.length > 0) {
+                        supplierOrConditions.push({ "variants.batches.supplierId": { $in: supplierIdCandidates } });
+                    }
+                    if (supplierNameCandidates.length > 0) {
+                        supplierOrConditions.push(
+                            { "variants.batches.supplierName": { $in: supplierNameCandidates } },
+                            { "variants.batches.supplier": { $in: supplierNameCandidates } },
+                            { supplierName: { $in: supplierNameCandidates } },
+                            { supplier: { $in: supplierNameCandidates } }
+                        );
+                    } else if (!ObjectId.isValid(rawSupplier)) {
+                        supplierOrConditions.push(
+                            { "variants.batches.supplierName": supplierRegex },
+                            { "variants.batches.supplier": supplierRegex },
+                            { supplierName: supplierRegex },
+                            { supplier: supplierRegex }
+                        );
+                    }
+
+                    if (supplierOrConditions.length > 0) {
+                        andConditions.push({ $or: supplierOrConditions });
+                    }
                 }
 
                 const matchStage = andConditions.length > 0 ? { $and: andConditions } : {};
