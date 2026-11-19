@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const { MongoClient, ObjectId } = require('mongodb');
 const crypto = require('crypto');
 const cors = require('cors');
@@ -29,6 +29,51 @@ async function connectToMongoDB() {
         const supplierCollection = db.collection("suppliers");
         const salesCollection = db.collection('sales');
 
+        // Helper to generate a collision-free 5-character cryptographic alphanumeric variant ID (e.g. 7X9KM)
+        async function generateVariantId(localExistingIds = new Set()) {
+            const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+            while (true) {
+                let code = '';
+                for (let i = 0; i < 5; i++) {
+                    code += chars[crypto.randomInt(0, chars.length)];
+                }
+                if (localExistingIds.has(code)) continue;
+
+                // Check uniqueness against MongoDB catalog
+                const existing = await productCollection.findOne(
+                    { "variants.variantId": code },
+                    { projection: { _id: 1 } }
+                );
+                if (!existing) {
+                    localExistingIds.add(code);
+                    return code;
+                }
+            }
+        }
+
+        // Helper to generate a collision-free 5-character cryptographic alphanumeric Payment ID (e.g. PAY-7X9KM)
+        async function generatePaymentId(localExistingIds = new Set()) {
+            const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+            while (true) {
+                let code = '';
+                for (let i = 0; i < 5; i++) {
+                    code += chars[crypto.randomInt(0, chars.length)];
+                }
+                const candidateId = `PAY-${code}`;
+                if (localExistingIds.has(candidateId)) continue;
+
+                // Check uniqueness against MongoDB purchase collection
+                const existing = await purchaseCollection.findOne(
+                    { "payments.paymentId": candidateId },
+                    { projection: { _id: 1 } }
+                );
+                if (!existing) {
+                    localExistingIds.add(candidateId);
+                    return candidateId;
+                }
+            }
+        }
+
         // Ensure unique index on invoiceNo to guarantee mathematical non-duplication
         salesCollection.createIndex({ invoiceNo: 1 }, { unique: true }).catch(err => console.error("Error creating sales invoice index:", err));
 
@@ -46,6 +91,14 @@ async function connectToMongoDB() {
         productCollection.createIndex({ name: 1 }).catch(() => { });
         productCollection.createIndex({ brand: 1 }).catch(() => { });
         productCollection.createIndex({ "variants.barcode": 1 }).catch(() => { });
+        // Ensure unique index on variantId to guarantee mathematical non-duplication across catalog
+        productCollection.createIndex({ "variants.variantId": 1 }, { unique: true, sparse: true }).catch(err => {
+            if (err && err.codeName === 'IndexOptionsConflict') {
+                productCollection.dropIndex("variants.variantId_1").then(() => {
+                    productCollection.createIndex({ "variants.variantId": 1 }, { unique: true, sparse: true });
+                }).catch(() => { });
+            }
+        });
         categoryCollection.createIndex({ createdAt: -1 }).catch(() => { });
 
         // Supplier & Purchase indexes for fast relational lookup, purchase linking, and sort
@@ -60,6 +113,7 @@ async function connectToMongoDB() {
         purchaseCollection.createIndex({ productId: 1 }).catch(() => { });
         purchaseCollection.createIndex({ totalCost: -1 }).catch(() => { });
         purchaseCollection.createIndex({ totalQuantity: -1 }).catch(() => { });
+        purchaseCollection.createIndex({ "payments.paymentId": 1 }).catch(() => { });
         productCollection.createIndex({ "variants.batches.supplierId": 1 }).catch(() => { });
         productCollection.createIndex({ "variants.batches.supplierName": 1 }).catch(() => { });
         productCollection.createIndex({ "variants.batches.supplier": 1 }).catch(() => { });
@@ -978,12 +1032,15 @@ async function connectToMongoDB() {
                         const soldImeiSet = new Set(extractImeiStrings(soldItem.imeis));
 
                         product.variants = product.variants.map((variant) => {
+                            const soldVariantId = String(soldItem.variantId || '').trim();
+                            const variantId = String(variant.variantId || '').trim();
                             const soldBarcode = String(soldItem.barcode || '').trim().toLowerCase();
                             const soldTitle = String(soldItem.variantTitle || '').trim().toLowerCase();
                             const variantBarcode = String(variant.barcode || '').trim().toLowerCase();
                             const variantTitle = String(variant.title || '').trim().toLowerCase();
 
-                            const isMatch = (soldBarcode && variantBarcode && variantBarcode === soldBarcode) ||
+                            const isMatch = (soldVariantId && variantId && variantId === soldVariantId) ||
+                                (soldBarcode && variantBarcode && variantBarcode === soldBarcode) ||
                                 (soldTitle && variantTitle && variantTitle === soldTitle) ||
                                 (product.variants.length === 1);
 
@@ -1850,7 +1907,9 @@ async function connectToMongoDB() {
                     image = typeof firstImg === 'object' && firstImg !== null ? (firstImg.url || '') : String(firstImg || '');
                 }
 
-                const itemKey = `${product._id}-${variant.barcode || variant.title || 'default'}`;
+                const itemKey = variant.variantId
+                    ? `${product._id}-${variant.variantId}`
+                    : `${product._id}-${variant.barcode || variant.title || 'default'}`;
 
                 // Check if scanned code matches any IMEI of the variant
                 let selectedImeis = [];
@@ -1871,6 +1930,7 @@ async function connectToMongoDB() {
                 const cartData = {
                     itemKey,
                     productId: product._id,
+                    variantId: variant.variantId || '',
                     name: product.name || 'Unnamed Product',
                     brand: product.brand || '',
                     model: product.model || '',
@@ -2469,6 +2529,17 @@ async function connectToMongoDB() {
         app.post("/product", async (req, res) => {
             try {
                 const data = req.body;
+                if (Array.isArray(data.variants)) {
+                    const localIds = new Set();
+                    data.variants = await Promise.all(data.variants.map(async (v) => {
+                        const variantId = v.variantId || await generateVariantId(localIds);
+                        localIds.add(variantId);
+                        return {
+                            ...v,
+                            variantId
+                        };
+                    }));
+                }
                 if (!data.status || typeof data.status !== 'string') {
                     data.status = "active";
                 }
@@ -3013,17 +3084,47 @@ async function connectToMongoDB() {
             }
         });
 
-        // POST /purchase -> Record a new stock purchase and merge variant stock + IMEIs into the product collection
+        // POST /purchase -> High-Speed Optimized: Parallel Execution + Lightweight Projection + Full Accounting/Due Tracking
         app.post("/purchase", async (req, res) => {
             try {
                 const data = req.body;
                 data.createdAt = new Date();
                 data.updatedAt = new Date();
 
-                // Normalize IMEIs across purchased variants
+                // 1. Origin & Exchange Traceability
+                const purchaseType = data.purchaseType || (data.isExchange ? "exchange" : "wholesale");
+                data.purchaseType = purchaseType;
+                data.isExchange = Boolean(data.isExchange || purchaseType === "exchange");
+                data.exchangeId = data.exchangeId && ObjectId.isValid(data.exchangeId) ? new ObjectId(data.exchangeId) : null;
+                data.exchangeNo = data.exchangeNo || null;
+
+                // 2. Normalize Nested Supplier Object
+                const rawSup = data.supplier && typeof data.supplier === "object" ? data.supplier : {};
+                const supId = rawSup.supplierId || data.supplierId;
+                const supplierId = supId && ObjectId.isValid(supId) ? new ObjectId(supId) : null;
+                const supplierType = rawSup.type || (purchaseType === "exchange" ? "customer" : "vendor");
+                const supplierName = (rawSup.name || data.supplierName || data.supplier || (supplierType === "customer" ? "Walk-In Customer" : "Wholesale Vendor")).trim();
+                const supplierPhone = (rawSup.phone || data.supplierPhone || "").trim();
+                const supplierNid = (rawSup.nid || data.supplierNid || "").trim();
+                const supplierAddress = (rawSup.address || data.supplierAddress || "").trim();
+
+                data.supplier = {
+                    supplierId,
+                    type: supplierType,
+                    name: supplierName,
+                    phone: supplierPhone,
+                    nid: supplierNid,
+                    address: supplierAddress
+                };
+                data.supplierId = supplierId;
+                data.supplierName = supplierName; // Backward compatibility mirror
+
+                // 3. Normalize IMEIs across purchased variants
                 if (Array.isArray(data.variants)) {
                     data.variants = data.variants.map(v => ({
                         ...v,
+                        returnedQuantity: Number(v.returnedQuantity) || 0,
+                        returnedImeis: Array.isArray(v.returnedImeis) ? v.returnedImeis : [],
                         imeis: (Array.isArray(v.imeis) ? v.imeis : []).map(item => {
                             if (typeof item === 'string') {
                                 const trimmed = item.trim();
@@ -3039,8 +3140,22 @@ async function connectToMongoDB() {
                     }));
                 }
 
-                // Precompute summary metrics for light-speed query indexing
-                const purchasedVariants = Array.isArray(data.variants) ? data.variants : [];
+                // 4. Precompute summary metrics and ensure collision-free variantIds
+                const assignedPurchaseIds = new Set();
+                const purchasedVariants = await Promise.all(
+                    (Array.isArray(data.variants) ? data.variants : []).map(async (v) => {
+                        const variantId = v.variantId || await generateVariantId(assignedPurchaseIds);
+                        assignedPurchaseIds.add(variantId);
+                        return {
+                            ...v,
+                            variantId,
+                            returnedQuantity: Number(v.returnedQuantity) || 0,
+                            returnedImeis: Array.isArray(v.returnedImeis) ? v.returnedImeis : []
+                        };
+                    })
+                );
+                data.variants = purchasedVariants;
+
                 let totalQty = 0;
                 let subtotal = 0;
                 let totalImeis = 0;
@@ -3057,166 +3172,222 @@ async function connectToMongoDB() {
 
                 const shippingCost = Number(data.shippingCost) || 0;
                 const extraCost = Number(data.extraCost) || 0;
-                const totalCost = subtotal + shippingCost + extraCost;
+                const includeShippingInTotal = data.includeShippingInTotal === true;
+                const includeExtraInTotal = data.includeExtraInTotal === true;
+                const totalCost = data.totalCost !== undefined && data.totalCost !== ''
+                    ? Number(data.totalCost)
+                    : subtotal + (includeShippingInTotal ? shippingCost : 0) + (includeExtraInTotal ? extraCost : 0);
 
                 data.totalQuantity = totalQty;
                 data.subtotal = subtotal;
                 data.shippingCost = shippingCost;
                 data.extraCost = extraCost;
+                data.includeShippingInTotal = includeShippingInTotal;
+                data.includeExtraInTotal = includeExtraInTotal;
                 data.totalCost = totalCost;
                 data.totalVariants = purchasedVariants.length;
                 data.totalImeis = totalImeis;
-                data.supplierName = data.supplierName || data.supplier || "";
 
-                // 1. Save the purchase record as an audit log
-                const result = await purchaseCollection.insertOne(data);
+                // 5. Payment, Due, and Multi-Installment Tracking
+                const paidAmount = data.paidAmount !== undefined && data.paidAmount !== ''
+                    ? Math.max(0, Number(data.paidAmount))
+                    : totalCost;
+                const dueAmount = Math.max(0, totalCost - paidAmount);
+                const paymentStatus = data.paymentStatus || (dueAmount === 0 ? "paid" : (paidAmount > 0 ? "partial" : "due"));
+                const paymentMethod = data.paymentMethod || (purchaseType === "exchange" ? "Trade-In Credit" : "Cash");
 
-                // 2. Merge purchased variants into the product collection (live stock source of truth)
+                const localPaymentIds = new Set();
+                const rawPayments = Array.isArray(data.payments) && data.payments.length > 0
+                    ? data.payments
+                    : (paidAmount > 0 ? [
+                        {
+                            amount: paidAmount,
+                            method: paymentMethod,
+                            date: data.purchaseDate ? new Date(data.purchaseDate) : new Date(),
+                            note: data.paymentNote || (purchaseType === "exchange" ? "Trade-in value credited" : "Initial payment")
+                        }
+                    ] : []);
+
+                const payments = await Promise.all(
+                    rawPayments.map(async (p) => {
+                        const paymentId = p.paymentId || await generatePaymentId(localPaymentIds);
+                        localPaymentIds.add(paymentId);
+                        return {
+                            paymentId,
+                            amount: Number(p.amount) || 0,
+                            method: p.method || paymentMethod,
+                            date: p.date ? new Date(p.date) : new Date(),
+                            note: p.note || data.paymentNote || ""
+                        };
+                    })
+                );
+
+                data.paidAmount = paidAmount;
+                data.dueAmount = dueAmount;
+                data.paymentStatus = paymentStatus;
+                data.paymentMethod = paymentMethod;
+                data.payments = payments;
+
+                // 6. Return Lifecycle Defaults
+                data.returnStatus = data.returnStatus || "none";
+                data.refundAmount = Number(data.refundAmount) || 0;
+                data.returns = Array.isArray(data.returns) ? data.returns : [];
+
+                // ⚡ SPEED OPTIMIZATION 1: PARALLEL EXECUTION & SPEED OPTIMIZATION 2: LIGHTWEIGHT PROJECTION
+                // Runs insertOne AND findOne at the exact same moment; only fetches lightweight fields!
                 const productId = data.productId;
+                const productQuery = (productId && ObjectId.isValid(productId) && purchasedVariants.length > 0)
+                    ? { _id: new ObjectId(productId) }
+                    : null;
 
-                if (productId && ObjectId.isValid(productId) && purchasedVariants.length > 0) {
-                    const productQuery = { _id: new ObjectId(productId) };
-                    const product = await productCollection.findOne(productQuery);
+                const [result, product] = await Promise.all([
+                    purchaseCollection.insertOne(data),
+                    productQuery ? productCollection.findOne(productQuery, {
+                        projection: { variants: 1, productType: 1, hasImei: 1 }
+                    }) : null
+                ]);
 
-                    if (product) {
-                        const existingVariants = Array.isArray(product.variants) ? product.variants : [];
-                        const updatedVariants = [...existingVariants];
+                // 7. Merge purchased variants and batches into productCollection
+                if (product && productQuery) {
+                    const existingVariants = Array.isArray(product.variants) ? product.variants : [];
+                    const updatedVariants = [...existingVariants];
+                    const isSimple = product.productType === "simple" || data.productType === "simple";
 
-                        const isSimple = product.productType === "simple" || data.productType === "simple";
+                    for (const incoming of purchasedVariants) {
+                        const incomingTitle = (incoming.title || "").trim().toLowerCase();
+                        const incomingBarcode = (incoming.barcode || "").trim().toLowerCase();
+                        const incomingQty = Number(incoming.quantity) || 0;
+                        const incomingPrice = Number(incoming.purchasePrice) || 0;
+                        const incomingImeis = Array.isArray(incoming.imeis) ? incoming.imeis : [];
 
-                        for (const incoming of purchasedVariants) {
-                            const incomingTitle = (incoming.title || "").trim().toLowerCase();
-                            const incomingBarcode = (incoming.barcode || "").trim().toLowerCase();
-                            const incomingQty = Number(incoming.quantity) || 0;
-                            const incomingPrice = Number(incoming.purchasePrice) || 0;
-                            const incomingImeis = Array.isArray(incoming.imeis) ? incoming.imeis : [];
+                        const newBatch = {
+                            batchId: new ObjectId().toString(),
+                            invoiceNo: data.invoiceNo || (purchaseType === "exchange" ? data.exchangeNo : "") || "",
+                            supplierId: supplierId || null,
+                            supplierName: supplierName,
+                            supplierType: supplierType,
+                            purchasePrice: incomingPrice,
+                            receivedQuantity: incomingQty,
+                            remainingQuantity: incomingQty,
+                            imeis: incomingImeis,
+                            purchaseDate: data.purchaseDate ? new Date(data.purchaseDate) : new Date(),
+                            createdAt: new Date()
+                        };
 
-                            // Create new batch record for this purchase with its specific IMEIs
-                            const newBatch = {
-                                batchId: new ObjectId().toString(),
-                                invoiceNo: data.invoiceNo || "",
-                                supplierId: data.supplierId || null,
-                                purchasePrice: incomingPrice,
-                                receivedQuantity: incomingQty,
-                                remainingQuantity: incomingQty,
-                                imeis: incomingImeis,
-                                purchaseDate: data.purchaseDate ? new Date(data.purchaseDate) : new Date(),
-                                createdAt: new Date()
-                            };
+                        const incomingVariantId = (incoming.variantId || "").trim();
+                        const matchIndex = updatedVariants.findIndex((v) => {
+                            if (isSimple && updatedVariants.length === 1) return true;
+                            const vVariantId = (v.variantId || "").trim();
+                            if (incomingVariantId && vVariantId && incomingVariantId === vVariantId) return true;
+                            const vTitle = (v.title || "").trim().toLowerCase();
+                            const vBarcode = (v.barcode || "").trim().toLowerCase();
+                            const titleMatch = incomingTitle && vTitle && vTitle === incomingTitle;
+                            const barcodeMatch = incomingBarcode && vBarcode && vBarcode === incomingBarcode;
+                            return titleMatch || barcodeMatch;
+                        });
 
-                            // Match existing variant by title or barcode (or single standard variant if simple product)
-                            const matchIndex = updatedVariants.findIndex((v) => {
-                                if (isSimple && updatedVariants.length === 1) {
-                                    return true;
-                                }
-                                const vTitle = (v.title || "").trim().toLowerCase();
-                                const vBarcode = (v.barcode || "").trim().toLowerCase();
-                                const titleMatch = incomingTitle && vTitle && vTitle === incomingTitle;
-                                const barcodeMatch = incomingBarcode && vBarcode && vBarcode === incomingBarcode;
-                                return titleMatch || barcodeMatch;
-                            });
+                        if (matchIndex !== -1) {
+                            const existing = updatedVariants[matchIndex];
+                            const existingBatches = Array.isArray(existing.batches) ? [...existing.batches] : [];
 
-                            if (matchIndex !== -1) {
-                                const existing = updatedVariants[matchIndex];
-                                const existingBatches = Array.isArray(existing.batches) ? [...existing.batches] : [];
+                            if (existingBatches.length === 0 && (Number(existing.quantity) || 0) > 0) {
+                                const legacyImeis = (Array.isArray(existing.imeis) ? existing.imeis : []).map(item => {
+                                    if (typeof item === 'string') {
+                                        const trimmed = item.trim();
+                                        return trimmed ? { imei1: trimmed, imei2: "" } : null;
+                                    }
+                                    if (item && typeof item === 'object') {
+                                        const im1 = (item.imei1 || item.imei || "").trim();
+                                        const im2 = (item.imei2 || "").trim();
+                                        return im1 ? { imei1: im1, imei2: im2 } : null;
+                                    }
+                                    return null;
+                                }).filter(Boolean);
 
-                                // Backfill legacy stock if variant had existing quantity but no batches
-                                if (existingBatches.length === 0 && (Number(existing.quantity) || 0) > 0) {
-                                    const legacyImeis = (Array.isArray(existing.imeis) ? existing.imeis : []).map(item => {
+                                existingBatches.push({
+                                    batchId: new ObjectId().toString(),
+                                    invoiceNo: "INITIAL-STOCK",
+                                    supplierId: null,
+                                    purchasePrice: Number(existing.purchasePrice) || 0,
+                                    receivedQuantity: Number(existing.quantity) || 0,
+                                    remainingQuantity: Number(existing.quantity) || 0,
+                                    imeis: legacyImeis,
+                                    purchaseDate: existing.createdAt ? new Date(existing.createdAt) : new Date(),
+                                    createdAt: new Date()
+                                });
+                            }
+                            if (incomingQty > 0) {
+                                existingBatches.push(newBatch);
+                            }
+
+                            const seen = new Set();
+                            const allActiveImeis = [];
+                            for (const b of existingBatches) {
+                                if (Array.isArray(b.imeis)) {
+                                    for (const item of b.imeis) {
+                                        let im1 = "";
+                                        let im2 = "";
                                         if (typeof item === 'string') {
-                                            const trimmed = item.trim();
-                                            return trimmed ? { imei1: trimmed, imei2: "" } : null;
+                                            im1 = item.trim();
+                                        } else if (item && typeof item === 'object') {
+                                            im1 = (item.imei1 || item.imei || "").trim();
+                                            im2 = (item.imei2 || "").trim();
                                         }
-                                        if (item && typeof item === 'object') {
-                                            const im1 = (item.imei1 || item.imei || "").trim();
-                                            const im2 = (item.imei2 || "").trim();
-                                            return im1 ? { imei1: im1, imei2: im2 } : null;
-                                        }
-                                        return null;
-                                    }).filter(Boolean);
-
-                                    existingBatches.push({
-                                        batchId: new ObjectId().toString(),
-                                        invoiceNo: "INITIAL-STOCK",
-                                        supplierId: null,
-                                        purchasePrice: Number(existing.purchasePrice) || 0,
-                                        receivedQuantity: Number(existing.quantity) || 0,
-                                        remainingQuantity: Number(existing.quantity) || 0,
-                                        imeis: legacyImeis,
-                                        purchaseDate: existing.createdAt ? new Date(existing.createdAt) : new Date(),
-                                        createdAt: new Date()
-                                    });
-                                }
-                                if (incomingQty > 0) {
-                                    existingBatches.push(newBatch);
-                                }
-
-                                // Gather all active IMEIs across all batches for fast variant lookup
-                                const seen = new Set();
-                                const allActiveImeis = [];
-                                for (const b of existingBatches) {
-                                    if (Array.isArray(b.imeis)) {
-                                        for (const item of b.imeis) {
-                                            let im1 = "";
-                                            let im2 = "";
-                                            if (typeof item === 'string') {
-                                                im1 = item.trim();
-                                            } else if (item && typeof item === 'object') {
-                                                im1 = (item.imei1 || item.imei || "").trim();
-                                                im2 = (item.imei2 || "").trim();
-                                            }
-                                            if (im1 && !seen.has(im1.toLowerCase())) {
-                                                seen.add(im1.toLowerCase());
-                                                allActiveImeis.push({ imei1: im1, imei2: im2 });
-                                            }
+                                        if (im1 && !seen.has(im1.toLowerCase())) {
+                                            seen.add(im1.toLowerCase());
+                                            allActiveImeis.push({ imei1: im1, imei2: im2 });
                                         }
                                     }
                                 }
-
-                                // Strip any legacy purchasePrice / lastPurchasePrice off the variant root
-                                const { purchasePrice, lastPurchasePrice, ...cleanedExisting } = existing;
-
-                                updatedVariants[matchIndex] = {
-                                    ...cleanedExisting,
-                                    title: existing.title || incoming.title || (isSimple ? "Standard" : ""),
-                                    combination: existing.combination || incoming.combination || [],
-                                    quantity: (Number(existing.quantity) || 0) + incomingQty,
-                                    retailPrice: Number(incoming.retailPrice) || existing.retailPrice || 0,
-                                    mrp: Number(incoming.mrp) || existing.mrp || 0,
-                                    barcode: incoming.barcode || existing.barcode || "",
-                                    batches: existingBatches,
-                                    imeis: allActiveImeis,
-                                    updatedAt: new Date()
-                                };
-                            } else {
-                                // Brand new variant -> push it into the product variants array
-                                updatedVariants.push({
-                                    title: incoming.title || (isSimple ? "Standard" : ""),
-                                    combination: Array.isArray(incoming.combination) ? incoming.combination : [],
-                                    attributes: Array.isArray(incoming.attributes) ? incoming.attributes : [],
-                                    barcode: incoming.barcode || "",
-                                    retailPrice: Number(incoming.retailPrice) || 0,
-                                    mrp: Number(incoming.mrp) || 0,
-                                    quantity: incomingQty,
-                                    batches: incomingQty > 0 ? [newBatch] : [],
-                                    imeis: incomingImeis,
-                                    createdAt: new Date(),
-                                    updatedAt: new Date()
-                                });
                             }
-                        }
 
-                        // Sync hasImei flag on the product if this purchase tracks IMEIs
-                        const hasImeiUpdate = data.hasImei === true ? { hasImei: true } : {};
+                            const { purchasePrice, lastPurchasePrice, ...cleanedExisting } = existing;
+                            const existingVariantId = existing.variantId || incomingVariantId || await generateVariantId(assignedPurchaseIds);
+                            assignedPurchaseIds.add(existingVariantId);
 
-                        await productCollection.updateOne(productQuery, {
-                            $set: {
-                                variants: updatedVariants,
-                                ...hasImeiUpdate,
+                            updatedVariants[matchIndex] = {
+                                variantId: existingVariantId,
+                                ...cleanedExisting,
+                                title: existing.title || incoming.title || (isSimple ? "Standard" : ""),
+                                combination: existing.combination || incoming.combination || [],
+                                quantity: (Number(existing.quantity) || 0) + incomingQty,
+                                retailPrice: Number(incoming.retailPrice) || existing.retailPrice || 0,
+                                mrp: Number(incoming.mrp) || existing.mrp || 0,
+                                barcode: incoming.barcode || existing.barcode || "",
+                                batches: existingBatches,
+                                imeis: allActiveImeis,
                                 updatedAt: new Date()
-                            }
-                        });
+                            };
+                        } else {
+                            const newVariantId = incomingVariantId || await generateVariantId(assignedPurchaseIds);
+                            assignedPurchaseIds.add(newVariantId);
+
+                            updatedVariants.push({
+                                variantId: newVariantId,
+                                title: incoming.title || (isSimple ? "Standard" : ""),
+                                combination: Array.isArray(incoming.combination) ? incoming.combination : [],
+                                attributes: Array.isArray(incoming.attributes) ? incoming.attributes : [],
+                                barcode: incoming.barcode || "",
+                                retailPrice: Number(incoming.retailPrice) || 0,
+                                mrp: Number(incoming.mrp) || 0,
+                                quantity: incomingQty,
+                                batches: incomingQty > 0 ? [newBatch] : [],
+                                imeis: incomingImeis,
+                                createdAt: new Date(),
+                                updatedAt: new Date()
+                            });
+                        }
                     }
+
+                    const hasImeiUpdate = data.hasImei === true ? { hasImei: true } : {};
+
+                    await productCollection.updateOne(productQuery, {
+                        $set: {
+                            variants: updatedVariants,
+                            ...hasImeiUpdate,
+                            updatedAt: new Date()
+                        }
+                    });
                 }
 
                 res.send(result);
@@ -3262,10 +3433,30 @@ async function connectToMongoDB() {
                                 {
                                     $match: {
                                         $expr: {
-                                            $or: [
-                                                { $in: ["$$supIdStr", { $ifNull: ["$variants.batches.supplierId", []] }] },
-                                                { $in: ["$$supId", { $ifNull: ["$variants.batches.supplierId", []] }] },
-                                                { $and: [{ $ne: ["$$supName", null] }, { $ne: ["$$supName", ""] }, { $in: ["$$supName", { $ifNull: ["$variants.batches.supplier", []] }] }] }
+                                            $gt: [
+                                                {
+                                                    $size: {
+                                                        $filter: {
+                                                            input: {
+                                                                $reduce: {
+                                                                    input: { $ifNull: ["$variants", []] },
+                                                                    initialValue: [],
+                                                                    in: { $concatArrays: ["$$value", { $ifNull: ["$$this.batches", []] }] }
+                                                                }
+                                                            },
+                                                            as: "b",
+                                                            cond: {
+                                                                $or: [
+                                                                    { $eq: ["$$b.supplierId", "$$supIdStr"] },
+                                                                    { $eq: ["$$b.supplierId", "$$supId"] },
+                                                                    { $and: [{ $ne: ["$$supName", null] }, { $ne: ["$$supName", ""] }, { $eq: ["$$b.supplier", "$$supName"] }] },
+                                                                    { $and: [{ $ne: ["$$supName", null] }, { $ne: ["$$supName", ""] }, { $eq: ["$$b.supplierName", "$$supName"] }] }
+                                                                ]
+                                                            }
+                                                        }
+                                                    }
+                                                },
+                                                0
                                             ]
                                         }
                                     }
@@ -3289,7 +3480,8 @@ async function connectToMongoDB() {
                                                             $or: [
                                                                 { $eq: ["$$this.supplierId", "$$supIdStr"] },
                                                                 { $eq: ["$$this.supplierId", "$$supId"] },
-                                                                { $eq: ["$$this.supplier", "$$supName"] }
+                                                                { $and: [{ $ne: ["$$supName", null] }, { $ne: ["$$supName", ""] }, { $eq: ["$$this.supplier", "$$supName"] }] },
+                                                                { $and: [{ $ne: ["$$supName", null] }, { $ne: ["$$supName", ""] }, { $eq: ["$$this.supplierName", "$$supName"] }] }
                                                             ]
                                                         },
                                                         { $add: ["$$value", { $toDouble: { $ifNull: ["$$this.remainingQuantity", 0] } }] },
@@ -3303,7 +3495,7 @@ async function connectToMongoDB() {
                                 {
                                     $group: {
                                         _id: null,
-                                        productsCount: { $sum: 1 },
+                                        productIds: { $addToSet: { $toString: "$_id" } },
                                         totalStock: { $sum: "$stockFromSupplier" }
                                     }
                                 }
@@ -3332,7 +3524,7 @@ async function connectToMongoDB() {
                                     $group: {
                                         _id: null,
                                         purchasesCount: { $sum: 1 },
-                                        distinctProducts: { $addToSet: "$productId" }
+                                        distinctProducts: { $addToSet: { $toString: "$productId" } }
                                     }
                                 }
                             ],
@@ -3347,18 +3539,24 @@ async function connectToMongoDB() {
                     },
                     {
                         $addFields: {
-                            productsCount: {
-                                $max: [
-                                    { $ifNull: ["$pStats.productsCount", 0] },
-                                    { $size: { $ifNull: ["$purStats.distinctProducts", []] } }
+                            uniqueProducts: {
+                                $setUnion: [
+                                    { $ifNull: ["$pStats.productIds", []] },
+                                    {
+                                        $filter: {
+                                            input: { $ifNull: ["$purStats.distinctProducts", []] },
+                                            as: "pid",
+                                            cond: { $and: [{ $ne: ["$$pid", null] }, { $ne: ["$$pid", ""] }] }
+                                        }
+                                    }
                                 ]
-                            },
-                            totalProducts: {
-                                $max: [
-                                    { $ifNull: ["$pStats.productsCount", 0] },
-                                    { $size: { $ifNull: ["$purStats.distinctProducts", []] } }
-                                ]
-                            },
+                            }
+                        }
+                    },
+                    {
+                        $addFields: {
+                            productsCount: { $size: "$uniqueProducts" },
+                            totalProducts: { $size: "$uniqueProducts" },
                             totalStock: { $ifNull: ["$pStats.totalStock", 0] },
                             purchasesCount: { $ifNull: ["$purStats.purchasesCount", 0] }
                         }
@@ -3368,7 +3566,8 @@ async function connectToMongoDB() {
                             productStats: 0,
                             purchaseStats: 0,
                             pStats: 0,
-                            purStats: 0
+                            purStats: 0,
+                            uniqueProducts: 0
                         }
                     },
                     {
@@ -3452,7 +3651,7 @@ async function connectToMongoDB() {
                 };
                 const result = await supplierCollection.updateOne(query, updateDoc);
 
-                // If supplier name changed, sync purchase records referencing this supplier
+                // * if supplier name changed, sync purchase records referencing this supplier!!!!!!!!!!!!!!!!!!!!!!!
                 if (existingSupplier.name && existingSupplier.name !== trimmedName) {
                     await purchaseCollection.updateMany(
                         { $or: [{ supplierId: id }, { supplierId: new ObjectId(id) }, { supplier: existingSupplier.name }] },
@@ -3526,6 +3725,11 @@ async function connectToMongoDB() {
                 res.status(500).send({ message: "Failed to delete supplier" });
             }
         });
+
+        app.get("/demo-products", async (req, res) => {
+            const result = await productCollection.find().toArray()
+            res.send(result)
+        })
 
         console.log("You successfully connected to MongoDB!");
         return client;
